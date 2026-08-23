@@ -1282,6 +1282,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "brush-splat-render"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "brush-process",
+ "brush-render",
+ "brush-serde",
+ "burn",
+ "clap",
+ "env_logger",
+ "glam",
+ "image",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "brush-train"
 version = "1.0.0"
 dependencies = [

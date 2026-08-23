@@ -1,0 +1,32 @@
+[package]
+name = "brush-splat-render"
+edition.workspace = true
+version.workspace = true
+readme.workspace = true
+license.workspace = true
+
+# Standalone CLI: render a trained .ply against an explicit camera list.
+# Not part of the brush binary — see brush-render-utility.md for why.
+[[bin]]
+name = "brush-splat-render"
+path = "src/main.rs"
+
+[dependencies]
+brush-render.path = "../brush-render"
+brush-serde.path = "../brush-serde"
+brush-process.path = "../brush-process"
+
+burn.workspace = true
+glam.workspace = true
+image.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+
+tokio = { workspace = true, features = ["io-util", "fs", "macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

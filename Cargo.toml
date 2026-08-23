@@ -17,6 +17,7 @@ members = [
     "crates/brush-serde",
     "crates/brush-serde-macros",
     "crates/brush-sort",
+    "crates/brush-splat-render",
     "crates/brush-train",
     "crates/brush-vfs",
     "crates/colmap-reader",
