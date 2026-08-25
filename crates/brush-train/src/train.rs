@@ -210,6 +210,8 @@ impl SplatTrainer {
         // from the photometric loss before normals weigh in.
         let use_normals = self.config.normal_loss_weight > 0.0
             && self.step_count >= self.config.normal_loss_start_iter
+            && (self.step_count - self.config.normal_loss_start_iter)
+                .is_multiple_of(self.config.normal_loss_every)
             && batch.normal_data.is_some();
 
         let (mut grads, visible, num_visible, loss_inner) = {
@@ -301,8 +303,13 @@ impl SplatTrainer {
                     .features
                     .clone()
                     .expect("features were requested for the normal loss");
-                let n_loss = crate::normals::normal_loss(pred_normal, normal_data, &device);
-                loss = loss + n_loss * self.config.normal_loss_weight;
+                let gt_normal = Tensor::<2, Int>::from_data(normal_data, &device.clone().inner());
+                let n_loss = brush_loss::normal_loss(pred_normal, gt_normal);
+                // Subsampling is an unbiased estimator of the every-step
+                // objective: compensate for the lower sampling frequency.
+                loss = loss
+                    + n_loss
+                        * (self.config.normal_loss_weight * self.config.normal_loss_every as f32);
             }
 
             // Strip the autodiff graph off the loss so consumers can read the

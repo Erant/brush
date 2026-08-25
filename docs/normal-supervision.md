@@ -35,7 +35,8 @@ Enable it with:
 ```
 brush-cli <dataset> \
   --normal-loss-weight 0.05 \
-  --normal-loss-start-iter 5000
+  --normal-loss-start-iter 5000 \
+  --normal-loss-every 1
 ```
 
 - `--normal-loss-weight` (default `0.0`, disabled): weight in the total loss.
@@ -46,10 +47,13 @@ brush-cli <dataset> \
 - `--normal-loss-start-iter` (default `5000`): delays supervision until
   rough geometry has formed from the photometric loss alone. Turning it on
   too early fights still-forming, noisy splats.
+- `--normal-loss-every` (default `1`): evaluates the normal objective once
+  every N steps. The sampled loss is multiplied by N, preserving its expected
+  gradient contribution while avoiding its feature-gradient and loss graph on
+  intervening steps. Set it to `1` for the original every-step behavior.
 
-Once active, the loss runs **every step** — normals composite in the same
-render pass as color (see below), so there is no extra pipeline cost to
-amortize and no throttling flag.
+On sampled steps, normals composite in the same render pass as color (see
+below), sharing projection, sorting, and tile mapping.
 
 ## The architecture: a generic per-splat feature channel
 
@@ -91,8 +95,8 @@ consumer of that mechanism, per step once active:
    `world_space_normals` finds that axis via `argmin` over the raw
    log-scales (monotone in the true scales, including under the Mip
    3D-filter fold, so the fold op-chain is skipped; the Int `argmin` is a
-   free stop-gradient), builds a one-hot local-axis vector, rotates it into
-   world space with the existing `quaternion_vec_multiply` helper, and
+   free stop-gradient), builds a one-hot local-axis vector, selects the
+   corresponding quaternion rotation-matrix column, and
    normalizes the result (the stored quats are unnormalized). The result is
    sign-oriented to face the camera using `Tensor::sign()`, which has a zero
    backward gradient in burn — a proper stop-gradient.
@@ -106,10 +110,13 @@ consumer of that mechanism, per step once active:
    shared `transforms` param; summing the photometric and normal losses
    into one scalar before the single `backward()` accumulates both
    correctly — ordinary reverse-mode diamond-graph accumulation.
-4. **Loss** (`masked_l1_cosine_loss`): `L1 + (1 − cosine similarity)`
+4. **Loss** (`brush_loss::normal_loss`): `L1 + (1 − cosine similarity)`
    between the rendered and GT normal — both in raw `[-1, 1]` — masked to
    the GT foreground alpha; the same combined form used by MonoSDF and
-   DN-Splatter's normal term. The GT is stored as u8 and decoded on-GPU.
+   DN-Splatter's normal term. GT remains packed RGBA on the GPU. Custom
+   forward/backward kernels fuse byte decoding, axis conversion, masking,
+   L1, cosine, and their pixelwise gradients instead of constructing a long
+   graph of generic tensor operations.
 
 ## Camera-space axis convention
 
@@ -120,9 +127,8 @@ axis directions. Brush's internal camera space is OpenCV-style (+X right,
 `crates/brush-render/src/camera.rs`); Sapiens2 empirically uses the
 OpenGL-style convention (+Y up, +Z toward the viewer).
 
-The correction lives as a single named constant, `GT_AXIS_SIGN` in
-`crates/brush-train/src/normals.rs`, applied to the **GT** at the loss
-boundary (the sign flips are involutive, so one constant maps either
+The correction is applied to the **GT** while the fused loss kernel decodes
+its packed bytes (the sign flips are involutive, so the same signs map either
 direction) — the rendered feature stays a plain brush-convention normal.
 It was calibrated by scoring all 8 axis-sign combinations by masked mean
 cosine similarity against a sample dataset's GT maps; `[+X, −Y, −Z]` won
@@ -135,7 +141,7 @@ cargo run -p brush-bench-test --example normal_calib --release -- \
   <dataset_dir> <trained.ply>
 ```
 
-— and change that one constant.
+— and change the decode signs in the fused normal-loss kernels.
 
 ## What's deliberately out of scope here
 

@@ -5,7 +5,7 @@
 //! output range, backward produces finite gradients). Bit-exact reference
 //! matching is covered by the integration training tests in `brush-bench-test`.
 
-use brush_loss::{ImageLossConfig, image_loss};
+use brush_loss::{ImageLossConfig, image_loss, normal_loss};
 use burn::tensor::{Device, Int, Tensor, TensorData};
 use wasm_bindgen_test::wasm_bindgen_test;
 
@@ -138,6 +138,35 @@ async fn image_loss_backward_runs() {
         data.iter().all(|v| v.is_finite()),
         "gradients should be finite"
     );
+}
+
+#[wasm_bindgen_test(unsupported = tokio::test)]
+async fn fused_normal_loss_decodes_axes_masks_and_backpropagates() {
+    let device =
+        burn::tensor::Device::from(brush_cube::test_helpers::test_device().await).autodiff();
+    // First pixel decodes to brush axes [x,-y,-z]; second is transparent and
+    // must not affect either the loss or mask-normalising denominator.
+    let bytes = [192, 64, 32, 255, 255, 0, 255, 0];
+    let decoded = [
+        192.0 / 255.0 * 2.0 - 1.0,
+        1.0 - 64.0 / 255.0 * 2.0,
+        1.0 - 32.0 / 255.0 * 2.0,
+    ];
+    let pred = Tensor::<1>::from_floats(
+        [decoded[0], decoded[1], decoded[2], 10.0, -10.0, 5.0],
+        &device,
+    )
+    .reshape([1, 2, 3])
+    .require_grad();
+    let gt = gt_packed_from_bytes(&bytes, 1, 2, &device.inner());
+    let loss = normal_loss(pred.clone(), gt);
+    let value: f32 = loss.clone().into_scalar_async().await.expect("loss readback");
+    assert!(value.abs() < 1e-5, "matching normal should have zero loss, got {value}");
+    let grads = loss.backward();
+    let grad = pred.grad(&grads).expect("normal pred gradient");
+    let values: Vec<f32> = grad.into_data_async().await.expect("grad readback").to_vec().unwrap();
+    assert!(values.iter().all(|v| v.is_finite()));
+    assert_eq!(&values[3..], &[0.0, 0.0, 0.0]);
 }
 
 #[wasm_bindgen_test(unsupported = tokio::test)]

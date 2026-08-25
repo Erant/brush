@@ -227,6 +227,11 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
                 false,
                 enabled,
             );
+            ui.add(
+                Slider::new(&mut tc.normal_loss_every, 1..=32)
+                    .text("Normal loss every")
+                    .suffix(" steps"),
+            );
         }
     });
 

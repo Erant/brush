@@ -694,6 +694,79 @@ mod kernels {
         out[base + 1] = F::cast_from(g);
         out[base + 2] = F::cast_from(b);
     }
+
+    /// Fused masked L1 + cosine normal loss. `pred` is contiguous CHW and
+    /// `gt_packed` stores RGBA bytes in one u32 per pixel. The predictor uses
+    /// OpenGL camera axes, so Y/Z are flipped while decoding.
+    #[cube(launch)]
+    pub fn normal_loss_forward_kernel<F: Float>(
+        pred: &Tensor<F>,
+        gt_packed: &Tensor<u32>,
+        loss_map: &mut Tensor<F>,
+        h: u32,
+        w: u32,
+    ) {
+        let y = CUBE_POS_Y * BLOCK_Y + UNIT_POS_Y;
+        let x = CUBE_POS_X * BLOCK_X + UNIT_POS_X;
+        if x >= w || y >= h { terminate!(); }
+        let pix = (y * w + x) as usize;
+        let packed = gt_packed[pix];
+        if ((packed >> 24u32) & 0xffu32) <= 127u32 {
+            loss_map[pix] = F::cast_from(0.0_f32);
+            loss_map[(h * w) as usize + pix] = F::cast_from(0.0_f32);
+            terminate!();
+        }
+        loss_map[(h * w) as usize + pix] = F::cast_from(1.0_f32);
+        let plane = (h * w) as usize;
+        let px = pred[pix];
+        let py = pred[plane + pix];
+        let pz = pred[2usize * plane + pix];
+        let gx = F::cast_from(f32::cast_from(packed & 0xffu32) * (2.0_f32 * INV_255) - 1.0_f32);
+        let gy = F::cast_from(1.0_f32 - f32::cast_from((packed >> 8u32) & 0xffu32) * (2.0_f32 * INV_255));
+        let gz = F::cast_from(1.0_f32 - f32::cast_from((packed >> 16u32) & 0xffu32) * (2.0_f32 * INV_255));
+        let pn = F::sqrt(px * px + py * py + pz * pz);
+        let gn = F::sqrt(gx * gx + gy * gy + gz * gz);
+        let pn = F::max(pn, F::cast_from(1.0e-6_f32));
+        let gn = F::max(gn, F::cast_from(1.0e-6_f32));
+        let l1 = F::abs(px - gx) + F::abs(py - gy) + F::abs(pz - gz);
+        loss_map[pix] = l1 + F::cast_from(1.0_f32) - (px * gx + py * gy + pz * gz) / (pn * gn);
+    }
+
+    #[cube(launch)]
+    pub fn normal_loss_backward_kernel<F: Float>(
+        pred: &Tensor<F>,
+        gt_packed: &Tensor<u32>,
+        dl_dmap: &Tensor<F>,
+        dl_dpred: &mut Tensor<F>,
+        h: u32,
+        w: u32,
+    ) {
+        let y = CUBE_POS_Y * BLOCK_Y + UNIT_POS_Y;
+        let x = CUBE_POS_X * BLOCK_X + UNIT_POS_X;
+        if x >= w || y >= h { terminate!(); }
+        let pix = (y * w + x) as usize;
+        let packed = gt_packed[pix];
+        if ((packed >> 24u32) & 0xffu32) <= 127u32 { terminate!(); }
+        let plane = (h * w) as usize;
+        let px = pred[pix]; let py = pred[plane + pix]; let pz = pred[2usize * plane + pix];
+        let gx = F::cast_from(f32::cast_from(packed & 0xffu32) * (2.0_f32 * INV_255) - 1.0_f32);
+        let gy = F::cast_from(1.0_f32 - f32::cast_from((packed >> 8u32) & 0xffu32) * (2.0_f32 * INV_255));
+        let gz = F::cast_from(1.0_f32 - f32::cast_from((packed >> 16u32) & 0xffu32) * (2.0_f32 * INV_255));
+        let pn = F::max(F::sqrt(px * px + py * py + pz * pz), F::cast_from(1.0e-6_f32));
+        let gn = F::max(F::sqrt(gx * gx + gy * gy + gz * gz), F::cast_from(1.0e-6_f32));
+        let dot = px * gx + py * gy + pz * gz;
+        let inv = F::cast_from(1.0_f32) / (pn * gn);
+        let radial = dot / (pn * pn * pn * gn);
+        let chain = dl_dmap[pix];
+        let zero = F::cast_from(0.0_f32);
+        let one = F::cast_from(1.0_f32);
+        let sx = select(px < gx, -one, select(px > gx, one, zero));
+        let sy = select(py < gy, -one, select(py > gy, one, zero));
+        let sz = select(pz < gz, -one, select(pz > gz, one, zero));
+        dl_dpred[pix] = chain * (sx - gx * inv + px * radial);
+        dl_dpred[plane + pix] = chain * (sy - gy * inv + py * radial);
+        dl_dpred[2usize * plane + pix] = chain * (sz - gz * inv + pz * radial);
+    }
 }
 
 /// Image-loss configuration.
@@ -730,6 +803,13 @@ pub trait LossOps<B: Backend> {
     ) -> FloatTensor<B>;
 
     fn unpack_gt_rgb(gt_packed: IntTensor<B>, composite_bg: Option<Vec3>) -> FloatTensor<B>;
+
+    fn normal_loss_forward(pred: FloatTensor<B>, gt_packed: IntTensor<B>) -> FloatTensor<B>;
+    fn normal_loss_backward(
+        pred: FloatTensor<B>,
+        gt_packed: IntTensor<B>,
+        dl_dmap: FloatTensor<B>,
+    ) -> FloatTensor<B>;
 }
 
 fn alloc_zeros<R: CubeRuntime>(template: &CubeTensor<R>) -> CubeTensor<R> {
@@ -946,6 +1026,48 @@ fn launch_unpack_gt_rgb<R: CubeRuntime>(
     out
 }
 
+fn launch_normal_forward<R: CubeRuntime>(
+    pred: CubeTensor<R>,
+    gt_packed: CubeTensor<R>,
+) -> CubeTensor<R> {
+    use burn_cubecl::cubecl::prelude::{CubeCount, CubeDim};
+    let pred = into_contiguous(pred);
+    let gt_packed = into_contiguous(gt_packed);
+    let shape = pred.shape();
+    let dims = shape.as_slice();
+    let (h, w) = (dims[1] as u32, dims[2] as u32);
+    let out = burn_cubecl::ops::numeric::zeros_client::<R>(
+        pred.client.clone(), pred.device.clone(), Shape::new([2, h as usize, w as usize]), pred.dtype,
+    );
+    let client = pred.client.clone();
+    kernels::normal_loss_forward_kernel::launch::<f32, R>(
+        &client, CubeCount::Static(w.div_ceil(kernels::BLOCK_X), h.div_ceil(kernels::BLOCK_Y), 1),
+        CubeDim::new_2d(kernels::BLOCK_X, kernels::BLOCK_Y), pred.into_tensor_arg(),
+        gt_packed.into_tensor_arg(), out.clone().into_tensor_arg(), h, w,
+    );
+    out
+}
+
+fn launch_normal_backward<R: CubeRuntime>(
+    pred: CubeTensor<R>, gt_packed: CubeTensor<R>, dl_dmap: CubeTensor<R>,
+) -> CubeTensor<R> {
+    use burn_cubecl::cubecl::prelude::{CubeCount, CubeDim};
+    let pred = into_contiguous(pred);
+    let gt_packed = into_contiguous(gt_packed);
+    let dl_dmap = into_contiguous(dl_dmap);
+    let shape = pred.shape();
+    let dims = shape.as_slice();
+    let (h, w) = (dims[1] as u32, dims[2] as u32);
+    let out = alloc_zeros(&pred);
+    let client = pred.client.clone();
+    kernels::normal_loss_backward_kernel::launch::<f32, R>(
+        &client, CubeCount::Static(w.div_ceil(kernels::BLOCK_X), h.div_ceil(kernels::BLOCK_Y), 1),
+        CubeDim::new_2d(kernels::BLOCK_X, kernels::BLOCK_Y), pred.into_tensor_arg(),
+        gt_packed.into_tensor_arg(), dl_dmap.into_tensor_arg(), out.clone().into_tensor_arg(), h, w,
+    );
+    out
+}
+
 impl LossOps<Self> for MainBackendBase {
     fn image_loss_forward(
         pred: FloatTensor<Self>,
@@ -966,6 +1088,14 @@ impl LossOps<Self> for MainBackendBase {
 
     fn unpack_gt_rgb(gt_packed: IntTensor<Self>, composite_bg: Option<Vec3>) -> FloatTensor<Self> {
         launch_unpack_gt_rgb(gt_packed, composite_bg)
+    }
+
+    fn normal_loss_forward(pred: FloatTensor<Self>, gt_packed: IntTensor<Self>) -> FloatTensor<Self> {
+        launch_normal_forward(pred, gt_packed)
+    }
+
+    fn normal_loss_backward(pred: FloatTensor<Self>, gt_packed: IntTensor<Self>, dl_dmap: FloatTensor<Self>) -> FloatTensor<Self> {
+        launch_normal_backward(pred, gt_packed, dl_dmap)
     }
 }
 
@@ -1035,6 +1165,32 @@ impl LossOps<Self> for Fusion<MainBackendBase> {
             },
         )
     }
+
+
+    fn normal_loss_forward(pred: FloatTensor<Self>, gt_packed: IntTensor<Self>) -> FloatTensor<Self> {
+        let [_, h, w] = pred.shape().dims();
+        dispatch_custom("normal_loss_forward", [pred, gt_packed], Shape::new([2, h, w]), DType::F32,
+            move |desc, handles| {
+                let ([pred, gt], [out]) = desc.as_fixed();
+                let result = MainBackendBase::normal_loss_forward(
+                    handles.get_float_tensor::<MainBackendBase>(pred),
+                    handles.get_int_tensor::<MainBackendBase>(gt));
+                handles.register_float_tensor::<MainBackendBase>(&out.id, result);
+            })
+    }
+
+    fn normal_loss_backward(pred: FloatTensor<Self>, gt_packed: IntTensor<Self>, dl_dmap: FloatTensor<Self>) -> FloatTensor<Self> {
+        let shape = pred.shape();
+        dispatch_custom("normal_loss_backward", [pred, gt_packed, dl_dmap], shape, DType::F32,
+            move |desc, handles| {
+                let ([pred, gt, chain], [out]) = desc.as_fixed();
+                let result = MainBackendBase::normal_loss_backward(
+                    handles.get_float_tensor::<MainBackendBase>(pred),
+                    handles.get_int_tensor::<MainBackendBase>(gt),
+                    handles.get_float_tensor::<MainBackendBase>(chain));
+                handles.register_float_tensor::<MainBackendBase>(&out.id, result);
+            })
+    }
 }
 
 #[derive(Debug)]
@@ -1064,6 +1220,45 @@ impl<B: Backend + LossOps<B>> Backward<B, 1> for ImageLossBackward {
             grads.register::<B>(node.id, dl_dpred);
         }
     }
+}
+
+#[derive(Debug)]
+struct NormalLossBackward;
+
+#[derive(Debug, Clone)]
+struct NormalLossState<B: Backend> {
+    pred: FloatTensor<B>,
+    gt_packed: IntTensor<B>,
+}
+
+impl<B: Backend + LossOps<B>> Backward<B, 1> for NormalLossBackward {
+    type State = NormalLossState<B>;
+
+    fn backward(self, ops: Ops<Self::State, 1>, grads: &mut Gradients, _checkpointer: &mut Checkpointer) {
+        let dl_dmap = grads.consume::<B>(&ops.node);
+        let [pred_parent] = ops.parents;
+        let dl_dpred = B::normal_loss_backward(ops.state.pred, ops.state.gt_packed, dl_dmap);
+        if let Some(node) = pred_parent { grads.register::<B>(node.id, dl_dpred); }
+    }
+}
+
+/// Masked L1 + cosine loss for camera-space normal supervision. GT is a
+/// packed RGBA image; decode, axis conversion, mask, forward and backward
+/// pixel math each execute in one GPU kernel.
+pub fn normal_loss(pred: Tensor<3>, gt_packed: Tensor<2, Int>) -> Tensor<1> {
+    let pred_ad = unwrap_ad_wgpu_float(pred.permute([2, 0, 1]));
+    let gt = unwrap_wgpu_int(gt_packed);
+    let prep = NormalLossBackward.prepare::<NoCheckpointing>([pred_ad.node.clone()]).compute_bound().stateful();
+    let pred_p = pred_ad.primitive;
+    let map = <MainBackend as LossOps<MainBackend>>::normal_loss_forward(pred_p.clone(), gt.clone());
+    let map_ad = match prep {
+        OpsKind::Tracked(prep) => prep.finish(NormalLossState { pred: pred_p, gt_packed: gt }, map),
+        OpsKind::UnTracked(prep) => prep.finish(map),
+    };
+    let map: Tensor<3> = wrap_ad_wgpu_float(map_ad);
+    let loss = map.clone().slice(burn::tensor::s![0..1, .., ..]).sum();
+    let count = map.slice(burn::tensor::s![1..2, .., ..]).sum().clamp_min(1.0);
+    (loss / count).reshape([1])
 }
 
 /// L1 + SSIM image loss with optional bg-compositing and masking, all folded

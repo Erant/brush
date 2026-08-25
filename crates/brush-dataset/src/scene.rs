@@ -128,7 +128,7 @@ pub fn sample_to_packed_data(sample: DynamicImage) -> (TensorData, bool) {
     (TensorData::new(packed, [h as usize, w as usize]), has_alpha)
 }
 
-/// Convert a decoded monocular normal-map image into `[H, W, 4]` u8 data:
+/// Convert a decoded monocular normal-map image into packed `[H, W]` RGBA data:
 /// RGB is the `(n+1)/2 * 255` encoded unit normal (camera space), A is the
 /// foreground mask baked into the source PNG's alpha channel. Kept as raw
 /// bytes (4 B/px — same footprint as the RGB batch, and it's deep-copied
@@ -137,10 +137,8 @@ pub fn sample_to_packed_data(sample: DynamicImage) -> (TensorData, bool) {
 pub fn normal_sample_to_data(sample: DynamicImage) -> TensorData {
     let _span = tracing::trace_span!("normal_sample_to_data").entered();
     let (w, h) = (sample.width(), sample.height());
-    TensorData::new(
-        sample.into_rgba8().into_vec(),
-        [h as usize, w as usize, 4],
-    )
+    let packed: Vec<i32> = bytemuck::pod_collect_to_vec(&sample.into_rgba8().into_vec());
+    TensorData::new(packed, [h as usize, w as usize])
 }
 
 #[derive(Clone, Debug)]
@@ -152,7 +150,7 @@ pub struct SceneBatch {
     pub has_alpha: bool,
     pub alpha_mode: AlphaMode,
     pub camera: Camera,
-    /// `[H, W, 4]` u8 monocular normal-map data (see
+    /// Packed `[H, W]` RGBA monocular normal-map data (see
     /// [`normal_sample_to_data`]; decoded to f32 on the GPU by the normal
     /// loss), when the dataset carries one for this view. `None` when no
     /// `normals/` sibling was found — the normal loss is simply skipped for
@@ -168,7 +166,7 @@ impl SceneBatch {
 
 #[cfg(test)]
 mod tests {
-    use super::sample_to_packed_data;
+    use super::{normal_sample_to_data, sample_to_packed_data};
     use image::{DynamicImage, ImageBuffer, RgbImage, RgbaImage};
 
     #[test]
@@ -199,5 +197,14 @@ mod tests {
             packed.as_slice::<i32>().expect("i32 tensor"),
             &[0xff0b_0a09_u32 as i32, 0xff0e_0d0c_u32 as i32]
         );
+    }
+
+
+    #[test]
+    fn packs_normal_rgba_for_fused_gpu_loss() {
+        let image = RgbaImage::from_raw(2, 1, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let packed = normal_sample_to_data(DynamicImage::ImageRgba8(image));
+        assert_eq!(packed.shape.dims(), [1, 2]);
+        assert_eq!(packed.as_slice::<i32>().unwrap(), &[0x0403_0201, 0x0807_0605]);
     }
 }

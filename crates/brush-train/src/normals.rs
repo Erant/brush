@@ -13,9 +13,7 @@
 //! blend weights. See `docs/normal-supervision.md` for the full writeup.
 
 use brush_render::{camera::Camera, gaussian_splats::Splats};
-use burn::tensor::{Device, Int, Tensor, TensorData, s};
-
-use crate::quat_vec::quaternion_vec_multiply;
+use burn::tensor::{Device, Tensor, s};
 
 /// Broadcast a small constant vector to `[n, K]`. Built on the inner
 /// (non-autodiff) device and lifted via `Tensor::from_inner` — mirroring how
@@ -49,8 +47,6 @@ fn broadcast_row<const K: usize>(vals: [f32; K], n: usize, device: &Device) -> T
 /// loss for 15k steps — `[+X, -Y, -Z]` won decisively at 0.980 vs 0.762
 /// for the runner-up. Rerun that example to recalibrate for a different
 /// normal predictor; if it disagrees, flip signs here — nowhere else.
-const GT_AXIS_SIGN: [f32; 3] = [1.0, -1.0, -1.0];
-
 /// Per-splat world-space unit pseudo-normal: the splat's local axis with the
 /// smallest scale (standard proxy for vanilla anisotropic 3D Gaussians —
 /// splats naturally flatten against the surfaces they represent as training
@@ -71,13 +67,38 @@ fn world_space_normals(splats: &Splats, camera: &Camera) -> Tensor<2> {
     let n = log_scales.dims()[0];
     let device = log_scales.device();
     let axis_idx = log_scales.argmin(1).squeeze_dim::<1>(1); // [N] Int
-    let local_axis = axis_idx.float().one_hot::<2>(3); // [N, 3] one-hot on the shortest axis
+    let local_axis = axis_idx.float().one_hot::<2>(3);
 
-    // Rotate that local axis into world space. The quats are unnormalized
-    // (`rotations()` is a raw slice), so the rotated vector's length is
-    // |q|^2 — normalize the *output*, which is equivalent to normalizing
-    // the quat and cheaper.
-    let world_axis = quaternion_vec_multiply(quats, local_axis); // [N, 3]
+    // Specialise q*v*q^-1 for the one-hot shortest axis. This selects a
+    // rotation-matrix column directly, avoiding the generic quaternion/vector
+    // graph (and all of its vector slicing and zero multiplies).
+    let qw = quats.clone().slice(s![.., 0..1]);
+    let qx = quats.clone().slice(s![.., 1..2]);
+    let qy = quats.clone().slice(s![.., 2..3]);
+    let qz = quats.slice(s![.., 3..4]);
+    let ax = local_axis.clone().slice(s![.., 0..1]);
+    let ay = local_axis.clone().slice(s![.., 1..2]);
+    let az = local_axis.slice(s![.., 2..3]);
+    let two = 2.0;
+    let r00 = qw.clone() * qw.clone() + qx.clone() * qx.clone()
+        - qy.clone() * qy.clone() - qz.clone() * qz.clone();
+    let r01 = (qx.clone() * qy.clone() - qw.clone() * qz.clone()) * two;
+    let r02 = (qx.clone() * qz.clone() + qw.clone() * qy.clone()) * two;
+    let r10 = (qx.clone() * qy.clone() + qw.clone() * qz.clone()) * two;
+    let r11 = qw.clone() * qw.clone() - qx.clone() * qx.clone()
+        + qy.clone() * qy.clone() - qz.clone() * qz.clone();
+    let r12 = (qy.clone() * qz.clone() - qw.clone() * qx.clone()) * two;
+    let r20 = (qx.clone() * qz.clone() - qw.clone() * qy.clone()) * two;
+    let r21 = (qy.clone() * qz.clone() + qw.clone() * qx.clone()) * two;
+    let r22 = qw.clone() * qw - qx.clone() * qx - qy.clone() * qy + qz.clone() * qz;
+    let world_axis = Tensor::cat(
+        vec![
+            r00 * ax.clone() + r01 * ay.clone() + r02 * az.clone(),
+            r10 * ax.clone() + r11 * ay.clone() + r12 * az.clone(),
+            r20 * ax + r21 * ay + r22 * az,
+        ],
+        1,
+    );
     let axis_len = world_axis
         .clone()
         .powf_scalar(2.0)
@@ -103,22 +124,22 @@ fn world_space_normals(splats: &Splats, camera: &Camera) -> Tensor<2> {
 /// Rotate a `[N, 3]` world-space normal tensor into camera space using the
 /// camera's fixed (non-learned) rotation.
 fn rotate_to_camera_space(world_normal: Tensor<2>, camera: &Camera) -> Tensor<2> {
-    let n = world_normal.dims()[0];
-    let device = world_normal.device();
     // `camera.rotation` is the local(camera)-to-world rotation
     // (`Camera::local_to_world`); we need the inverse to go world -> camera.
     let world_to_cam = camera.rotation.inverse();
-    let q = broadcast_row(
-        [
-            world_to_cam.w,
-            world_to_cam.x,
-            world_to_cam.y,
-            world_to_cam.z,
+    let m = glam::Mat3::from_quat(world_to_cam);
+    let n = world_normal.dims()[0];
+    let x = world_normal.clone().slice([0..n, 0..1]);
+    let y = world_normal.clone().slice([0..n, 1..2]);
+    let z = world_normal.slice([0..n, 2..3]);
+    Tensor::cat(
+        vec![
+            x.clone() * m.x_axis.x + y.clone() * m.y_axis.x + z.clone() * m.z_axis.x,
+            x.clone() * m.x_axis.y + y.clone() * m.y_axis.y + z.clone() * m.z_axis.y,
+            x * m.x_axis.z + y * m.y_axis.z + z * m.z_axis.z,
         ],
-        n,
-        &device,
-    );
-    quaternion_vec_multiply(q, world_normal)
+        1,
+    )
 }
 
 /// Per-splat camera-space unit pseudo-normal in brush's camera convention,
@@ -126,50 +147,4 @@ fn rotate_to_camera_space(world_normal: Tensor<2>, camera: &Camera) -> Tensor<2>
 /// feature tensor handed to `render_splats_with_features`.
 pub fn splat_camera_normals(splats: &Splats, camera: &Camera) -> Tensor<2> {
     rotate_to_camera_space(world_space_normals(splats, camera), camera)
-}
-
-/// Masked `L1 + (1 - cosine similarity)` normal loss (the MonoSDF-style
-/// combined term also used by DN-Splatter's normal supervision), averaged
-/// over pixels where the GT foreground mask (`gt[..,..,3]`) is set. `pred`
-/// and `gt` are both `[H, W, 3]`; `mask` is `[H, W, 1]`.
-fn masked_l1_cosine_loss(pred: Tensor<3>, gt: Tensor<3>, mask: Tensor<3>) -> Tensor<1> {
-    let diff_l1 = (pred.clone() - gt.clone()).abs().sum_dim(2); // [H, W, 1]
-
-    let dot = pred.clone().mul(gt.clone()).sum_dim(2); // [H, W, 1]
-    let pred_norm = pred.powf_scalar(2.0).sum_dim(2).sqrt().clamp_min(1e-6);
-    let gt_norm = gt.powf_scalar(2.0).sum_dim(2).sqrt().clamp_min(1e-6);
-    let cosine = dot.div(pred_norm.mul(gt_norm));
-    let cosine_loss = cosine.neg().add_scalar(1.0); // 1 - cosine
-
-    let per_pixel = (diff_l1 + cosine_loss).mul(mask.clone()); // [H, W, 1]
-    let mask_count = mask.sum().clamp_min(1.0);
-    per_pixel.sum() / mask_count
-}
-
-/// Compute the masked L1 + cosine loss between a rendered normal map and
-/// the GT monocular prior.
-///
-/// `pred_normal` is the `[H, W, 3]` composited feature image from
-/// `SplatOutputDiff::features` (raw `[-1, 1]` camera-space normals, brush
-/// convention, on the autodiff graph). `gt_normal_data` is `[H, W, 4]` u8
-/// (RGB = `(n+1)/2 * 255` encoded normal in the predictor's convention,
-/// A = foreground mask — see `brush_dataset::scene::normal_sample_to_data`);
-/// it's decoded to `[-1, 1]` and converted to brush's camera convention via
-/// [`GT_AXIS_SIGN`] here.
-pub fn normal_loss(pred_normal: Tensor<3>, gt_normal_data: TensorData, device: &Device) -> Tensor<1> {
-    // GT is pure data — decode it on the inner (non-autodiff) device, then
-    // lift it onto the autodiff backend to combine with `pred` (mirrors
-    // `train.rs`'s handling of `gt_rgb_diff` for the LPIPS loss).
-    let inner_device = device.clone().inner();
-    let gt_int: Tensor<3, Int> = Tensor::from_data(gt_normal_data, &inner_device);
-    let gt_rgba = gt_int.float().div_scalar(255.0);
-    let gt_encoded = gt_rgba.clone().slice(s![.., .., 0..3]);
-    let sign: Tensor<1> = Tensor::from_floats(GT_AXIS_SIGN, &inner_device);
-    let gt_normal_inner = (gt_encoded.mul_scalar(2.0).add_scalar(-1.0)).mul(sign.reshape([1, 1, 3]));
-    let mask_inner = gt_rgba.slice(s![.., .., 3..4]).greater_elem(0.5).float();
-
-    let gt_normal: Tensor<3> = Tensor::from_inner(gt_normal_inner);
-    let mask: Tensor<3> = Tensor::from_inner(mask_inner);
-
-    masked_l1_cosine_loss(pred_normal, gt_normal, mask)
 }
