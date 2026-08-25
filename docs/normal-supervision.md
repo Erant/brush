@@ -95,11 +95,12 @@ consumer of that mechanism, per step once active:
    `world_space_normals` finds that axis via `argmin` over the raw
    log-scales (monotone in the true scales, including under the Mip
    3D-filter fold, so the fold op-chain is skipped; the Int `argmin` is a
-   free stop-gradient), builds a one-hot local-axis vector, selects the
-   corresponding quaternion rotation-matrix column, and
-   normalizes the result (the stored quats are unnormalized). The result is
-   sign-oriented to face the camera using `Tensor::sign()`, which has a zero
-   backward gradient in burn — a proper stop-gradient.
+   free stop-gradient), selects the corresponding quaternion rotation-matrix
+   column, and normalizes the result (the stored quats are unnormalized). A
+   custom GPU operator performs this in one forward launch; its analytic
+   backward writes quaternion gradients in one launch. Axis selection and the
+   camera-facing sign remain explicit stop-gradients, matching the previous
+   tensor implementation.
 2. **Rotate into camera space** (`rotate_to_camera_space`) using the
    camera's fixed rotation.
 3. **Render.** The `[N, 3]` camera-space normal is passed to

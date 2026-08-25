@@ -1,19 +1,21 @@
 //! Monocular normal-map supervision.
 //!
 //! The per-splat pseudo-normal (shortest-scale axis, oriented to face the
-//! camera, rotated into camera space) is computed with plain tensor ops
-//! here, then handed to the renderer as its generic `[N, 3]` per-splat
+//! camera, rotated into camera space) is computed by a fused differentiable
+//! GPU operator, then handed to the renderer as its generic `[N, 3]` per-splat
 //! feature input (`brush_render::bwd::render_splats_with_features`). The
 //! rasterizer alpha-composites it into three extra output channels in the
 //! *same* pass as the color render — projection, sorting and tile mapping
 //! are shared, so the marginal cost is just the extra blend lanes.
 //! Gradients flow back through the compositing into the feature tensor
-//! (and from there through the tensor-op derivation below into the shared
+//! (and from there through the fused analytic backward into the shared
 //! `transforms` param), and into position/rotation/scale/opacity via the
 //! blend weights. See `docs/normal-supervision.md` for the full writeup.
 
 use brush_render::{camera::Camera, gaussian_splats::Splats};
-use burn::tensor::{Device, Tensor, s};
+use burn::tensor::Tensor;
+#[cfg(test)]
+use burn::tensor::{Device, s};
 
 /// Broadcast a small constant vector to `[n, K]`. Built on the inner
 /// (non-autodiff) device and lifted via `Tensor::from_inner` — mirroring how
@@ -21,6 +23,7 @@ use burn::tensor::{Device, Tensor, s};
 /// splat-derived tensors that may be on the autodiff graph without tripping
 /// burn-dispatch's cross-backend assert (a plain `Tensor::from_floats(..,
 /// &device)` does not automatically pick up the autodiff-ness of `device`).
+#[cfg(test)]
 fn broadcast_row<const K: usize>(vals: [f32; K], n: usize, device: &Device) -> Tensor<2> {
     let inner: Tensor<1> = Tensor::from_floats(vals, &device.clone().inner());
     let lifted: Tensor<1> = Tensor::from_inner(inner);
@@ -52,6 +55,7 @@ fn broadcast_row<const K: usize>(vals: [f32; K], n: usize, device: &Device) -> T
 /// splats naturally flatten against the surfaces they represent as training
 /// progresses, so this axis converges toward the true surface normal),
 /// oriented to face the camera.
+#[cfg(test)]
 fn world_space_normals(splats: &Splats, camera: &Camera) -> Tensor<2> {
     let quats = splats.rotations(); // [N, 4] (w, x, y, z), unnormalized
     let means = splats.means(); // [N, 3]
@@ -123,6 +127,7 @@ fn world_space_normals(splats: &Splats, camera: &Camera) -> Tensor<2> {
 
 /// Rotate a `[N, 3]` world-space normal tensor into camera space using the
 /// camera's fixed (non-learned) rotation.
+#[cfg(test)]
 fn rotate_to_camera_space(world_normal: Tensor<2>, camera: &Camera) -> Tensor<2> {
     // `camera.rotation` is the local(camera)-to-world rotation
     // (`Camera::local_to_world`); we need the inverse to go world -> camera.
@@ -146,5 +151,68 @@ fn rotate_to_camera_space(world_normal: Tensor<2>, camera: &Camera) -> Tensor<2>
 /// `[N, 3]`, on the autodiff graph of the splats' params. This is the
 /// feature tensor handed to `render_splats_with_features`.
 pub fn splat_camera_normals(splats: &Splats, camera: &Camera) -> Tensor<2> {
+    brush_render::bwd::splat_camera_normals(splats.transforms.val(), camera)
+}
+
+#[cfg(test)]
+fn splat_camera_normals_reference(splats: &Splats, camera: &Camera) -> Tensor<2> {
     rotate_to_camera_space(world_space_normals(splats, camera), camera)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brush_render::gaussian_splats::SplatRenderMode;
+
+    fn splats(device: &Device) -> Splats {
+        Splats::from_raw(
+            vec![0.2, -0.3, 1.0, -0.6, 0.4, 2.0, 0.1, 0.8, 1.4],
+            vec![
+                0.91, 0.12, -0.21, 0.31,
+                0.72, -0.33, 0.18, 0.44,
+                1.10, 0.08, 0.27, -0.19,
+            ],
+            vec![-2.0, -0.3, 0.2, 0.1, -1.7, 0.5, 0.3, 0.7, -1.4],
+            vec![0.0; 9],
+            vec![0.0; 3],
+            SplatRenderMode::Default,
+            device,
+        )
+    }
+
+    async fn values(t: Tensor<2>) -> Vec<f32> {
+        t.into_data_async().await.unwrap().to_vec().unwrap()
+    }
+
+    #[tokio::test]
+    async fn fused_normals_match_tensor_reference_forward_and_backward() {
+        let device: Device = brush_cube::test_helpers::test_device().await.into();
+        let device = device.autodiff();
+        let camera = Camera {
+            position: glam::vec3(1.2, -0.7, -2.3),
+            rotation: glam::Quat::from_euler(glam::EulerRot::XYZ, 0.31, -0.27, 0.18),
+            ..Default::default()
+        };
+        let fused_splats = splats(&device);
+        let reference_splats = splats(&device);
+        let fused = splat_camera_normals(&fused_splats, &camera);
+        let reference = splat_camera_normals_reference(&reference_splats, &camera);
+        let fv = values(fused.clone()).await;
+        let rv = values(reference.clone()).await;
+        for (i, (a, b)) in fv.iter().zip(&rv).enumerate() {
+            assert!((a - b).abs() < 2e-5, "forward lane {i}: fused={a}, reference={b}");
+        }
+
+        let weights = Tensor::<1>::from_floats(
+            [0.7, -0.2, 0.4, -0.5, 0.9, 0.3, 0.2, 0.6, -0.8],
+            &device,
+        ).reshape([3, 3]);
+        let fg = (fused * weights.clone()).sum().backward();
+        let rg = (reference * weights).sum().backward();
+        let fgrad = values(fused_splats.transforms.grad(&fg).unwrap()).await;
+        let rgrad = values(reference_splats.transforms.grad(&rg).unwrap()).await;
+        for (i, (a, b)) in fgrad.iter().zip(&rgrad).enumerate() {
+            assert!((a - b).abs() < 3e-4, "gradient lane {i}: fused={a}, reference={b}");
+        }
+    }
 }

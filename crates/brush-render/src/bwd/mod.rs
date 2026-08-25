@@ -6,8 +6,10 @@
 //! defines `SplatOps`.
 pub mod burn_glue;
 mod kernels;
+mod normal_features;
 mod render_bwd;
 
 pub use burn_glue::{
     SplatOutputDiff, render_splats, render_splats_with_features, render_splats_with_pass,
 };
+pub use normal_features::splat_camera_normals;
