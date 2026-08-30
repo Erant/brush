@@ -89,6 +89,23 @@ pub struct TrainConfig {
     #[arg(long, help_heading = "Refine options", default_value = "0.1")]
     pub match_alpha_weight: f32,
 
+    /// Divide a masked view's loss (and its eval PSNR/SSIM) by the fraction of
+    /// the frame its mask covers, so masked and transparent views contribute
+    /// comparable gradient magnitude.
+    ///
+    /// The loss kernel multiplies each pixel by `gt.a`, but the trainer
+    /// averages over the whole frame — so a view whose mask covers 20% of the
+    /// frame otherwise contributes ~0.2x the gradient of a transparent view of
+    /// the same subject. In a mask-only run that is a uniform rescale and
+    /// harmless; in a run that mixes both alpha modes it is a systematic
+    /// per-view weighting. Off by default so existing runs and reported
+    /// metrics are unchanged.
+    ///
+    /// Exact for binary masks (`a` in {0, 255}); approximate for soft ones,
+    /// since the eval path squares the already-`a`-weighted residual.
+    #[arg(long, help_heading = "Training options")]
+    pub normalize_masked_loss: bool,
+
     #[arg(long, help_heading = "Refine options", default_value = "0.0")]
     pub lpips_loss_weight: f32,
 

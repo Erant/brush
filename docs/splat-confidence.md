@@ -73,6 +73,11 @@ Cost: one render + backward per training view, a few seconds for 81 views.
   loaded with the same dataset options — notably `--alpha-mode`; add
   `--write-evidence out.ply` to save the block for later runs), else warns and
   treats every splat as fully trusted (confidence degenerates to alpha).
+  "The same options" includes *omitting* `--alpha-mode` when training did: it
+  forces every view, so passing it against a dataset trained on a mix of alpha
+  modes (see [mixed-alpha-modes.md](mixed-alpha-modes.md)) re-reads the masked
+  views as transparent and measures evidence against differently premultiplied
+  ground truth than training saw.
 
 ## Confidence
 

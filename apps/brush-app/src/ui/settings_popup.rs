@@ -191,6 +191,25 @@ pub(crate) fn draw_settings(ui: &mut Ui, args: &mut TrainStreamConfig, enabled: 
             enabled,
         );
 
+        let mut normalize_masked = tc.normalize_masked_loss;
+        ui.add_enabled(
+            enabled,
+            egui::Checkbox::new(&mut normalize_masked, "Normalize masked loss"),
+        );
+        if enabled && normalize_masked != tc.normalize_masked_loss {
+            tc.normalize_masked_loss = normalize_masked;
+        }
+        if tc.normalize_masked_loss {
+            ui.label(
+                egui::RichText::new(
+                    "Scales a masked view's loss and eval metrics by its mask coverage, so \
+                     masked and transparent views weigh the same. Matters when a dataset \
+                     mixes both alpha modes.",
+                )
+                .weak(),
+            );
+        }
+
         // Weight 0 disables normal supervision entirely (the trainer skips
         // the feature render + loss), so the checkbox just toggles between
         // 0 and a sensible default weight.

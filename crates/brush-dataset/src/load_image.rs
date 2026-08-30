@@ -25,6 +25,7 @@ impl PartialEq for LoadImage {
             && self.mask_path == other.mask_path
             && self.normal_path == other.normal_path
             && self.max_resolution == other.max_resolution
+            && self.alpha_mode == other.alpha_mode
             && self.scale == other.scale
     }
 }
@@ -137,7 +138,10 @@ impl LoadImage {
         target_h: u32,
     ) -> Option<image::ImageResult<DynamicImage>> {
         let normal_path = self.normal_path.as_ref()?;
-        Some(self.load_normal_inner(normal_path, target_w, target_h).await)
+        Some(
+            self.load_normal_inner(normal_path, target_w, target_h)
+                .await,
+        )
     }
 
     async fn load_normal_inner(
@@ -197,6 +201,14 @@ impl LoadImage {
 
     pub fn alpha_mode(&self) -> AlphaMode {
         self.alpha_mode
+    }
+
+    /// Whether a `masks/` sidecar was found for this image. This is the signal
+    /// that drives the default [`AlphaMode`] (see [`Self::new`]); the dataset
+    /// loader reads it to tell whether a `--alpha-mode` override is flattening
+    /// a mix the sidecar layout would otherwise have produced.
+    pub fn has_mask_sidecar(&self) -> bool {
+        self.mask_path.is_some()
     }
 
     pub fn with_scale(mut self, scale: f32) -> Self {

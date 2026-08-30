@@ -32,6 +32,8 @@ Several rounds of cleanup: tabbed sidebar, persistent layout, a status bar that 
 
 More mask folder layouts accepted (COLMAP's `masks/img.jpeg.png`, `img.mask.*`, masks at arbitrary folder depths), mask resizing, and a configurable `--alpha_mode` exposed in CLI and UI ([#298](https://github.com/ArthurBrussee/brush/pull/298), [#300](https://github.com/ArthurBrussee/brush/pull/300), [#301](https://github.com/ArthurBrussee/brush/pull/301)).
 
+A single run can now mix masked and transparent views — the mode is resolved per view from whether that image has a `masks/` sidecar, and the loader logs the mode census plus a warning when `--alpha-mode` (still a global force) flattens a mix. New `--normalize-masked-loss` scales a masked view's loss and eval metrics by its mask coverage, so masked and transparent views weigh the same. Masked views also no longer composite the training background into their (non-premultiplied) ground truth, and are skipped by the LPIPS term, which has no mask path. See [docs/mixed-alpha-modes.md](docs/mixed-alpha-modes.md).
+
 #### Web compatibility & robustness
 
 WebGPU's workgroup dispatch limit is handled correctly, so resolutions above 2048 work ([#363](https://github.com/ArthurBrussee/brush/pull/363), from @promontis). A long-standing intersection-buffer corruption is fixed ([#373](https://github.com/ArthurBrussee/brush/pull/373)), as is a separate sort corruption past ~78M keys ([#385](https://github.com/ArthurBrussee/brush/pull/385)). Intersection and splat limits were raised so larger and higher-resolution scenes work ([#340](https://github.com/ArthurBrussee/brush/pull/340)).

@@ -34,6 +34,10 @@ brush-splat-render --splat scene.ply --cameras cameras.json --output-dir out/ \
 Evidence source, in order: the ply's `ev_*` block → `--dataset` (measure it
 now; the dataset options must match training, notably `--alpha-mode`) →
 none (warns, every splat fully trusted, confidence degenerates to alpha).
+`--alpha-mode` is a global force, so this pipeline's `masks`-as-alpha layout
+keeps working unchanged — but a dataset trained on a *mix* of alpha modes (see
+[mixed-alpha-modes.md](mixed-alpha-modes.md)) must omit the flag here too, or
+the evidence pass sees different ground truth than training did.
 Without `--confidence` the binary behaves exactly as before.
 
 ### The output contract in confidence mode — **this is the breaking part**

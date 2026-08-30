@@ -31,6 +31,12 @@ pub const BOUND_PERCENTILE: f32 = 0.8;
 
 const MIN_OPACITY: f32 = 1.0 / 255.0;
 
+/// Floor on a masked view's mask coverage when `normalize_masked_loss` divides
+/// by it, capping the amplification at 100x. A view whose mask covers almost
+/// nothing produces an almost-zero loss map, so this only guards the divide —
+/// it can't manufacture gradient out of an empty mask.
+pub(crate) const MIN_MASK_COVERAGE: f32 = 0.01;
+
 /// Fraction of training after which the Mip-Splatting 3D-filter floor stops
 /// being recomputed and is held frozen (still applied), so splats settle
 /// against a fixed target instead of chasing a moving floor.
@@ -257,8 +263,14 @@ impl SplatTrainer {
             let do_alpha_match = has_alpha && !masked_alpha && self.config.match_alpha_weight > 0.0;
             // Only composite when there's a real alpha channel and a non-zero
             // bg to mix in; the kernel skips the per-pixel `(1-a)*bg` math
-            // entirely when this is None.
-            let composite_bg = (has_alpha && background != glam::Vec3::ZERO).then_some(background);
+            // entirely when this is None. Masked mode is excluded: its GT is
+            // *not* premultiplied (`view_to_sample_image` only premultiplies
+            // in transparent mode), so folding `gt + (1-a)*bg` into it would
+            // compare a straight-alpha GT against a premultiplied-over-bg
+            // render at partial-mask edges. The `* gt.a` weighting kept the
+            // error small, but the math is wrong in intent and pure cost.
+            let composite_bg = (has_alpha && !masked_alpha && background != glam::Vec3::ZERO)
+                .then_some(background);
             let cfg = ImageLossConfig {
                 l1_weight: l1_w,
                 ssim_weight: ssim_w,
@@ -272,9 +284,6 @@ impl SplatTrainer {
             };
             let loss_map = image_loss(pred_for_loss, gt_packed.clone(), cfg);
 
-            // `loss` is only reassigned by the LPIPS path below, which is
-            // compiled out on wasm — so `mut` is unused there.
-            #[cfg_attr(target_family = "wasm", allow(unused_mut))]
             let mut loss = if do_alpha_match {
                 let rgb = loss_map.clone().slice(s![.., .., 0..3]).mean();
                 let alpha = loss_map.slice(s![.., .., 3..4]).mean();
@@ -283,10 +292,28 @@ impl SplatTrainer {
                 loss_map.mean()
             };
 
+            // A masked view's loss map is already `* gt.a`, but the mean above
+            // divides by the whole frame — so without this a small mask means a
+            // proportionally small gradient. Dividing by coverage turns it into
+            // a mean over the masked region instead. The floor caps
+            // amplification at 100x; a fully masked-out view has an all-zero
+            // loss map anyway, so it only guards the divide.
+            if masked_alpha && self.config.normalize_masked_loss {
+                let coverage = batch.alpha_coverage.unwrap_or(1.0).max(MIN_MASK_COVERAGE);
+                loss = loss / coverage;
+            }
+
             // LPIPS still needs an f32 RGB tensor for VGG. Materialising it
             // here costs ~99 MB at 4K, only when LPIPS is enabled.
+            // LPIPS is skipped on masked views: `unpack_gt_rgb` has no mask
+            // path, so the term would supervise exactly the background the
+            // photometric loss deliberately excludes. A per-pixel mask is not
+            // meaningful for VGG anyway — its receptive field spans the mask
+            // boundary — so dropping the term is the honest option.
             #[cfg(not(target_family = "wasm"))]
-            if let Some(lpips) = &self.lpips {
+            if let Some(lpips) = &self.lpips
+                && !masked_alpha
+            {
                 let gt_rgb = brush_loss::unpack_gt_rgb(gt_packed.clone(), composite_bg);
                 let gt_rgb_diff: Tensor<3> = Tensor::from_inner(gt_rgb);
                 loss = loss

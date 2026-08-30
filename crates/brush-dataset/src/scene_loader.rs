@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
 use brush_async::Actor;
+use brush_render::AlphaMode;
 use rand::{SeedableRng, seq::SliceRandom};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::{
     config::LoadDatasetConfig,
     scene::{
-        Scene, SceneBatch, SceneView, normal_sample_to_data, sample_to_packed_data,
+        Scene, SceneBatch, SceneView, mean_alpha, normal_sample_to_data, sample_to_packed_data,
         view_to_sample_image,
     },
 };
@@ -124,8 +125,14 @@ impl SceneLoader {
 /// view-by-view outside training (e.g. the end-of-training evidence pass).
 pub async fn load_view_batch(view: &SceneView) -> image::ImageResult<SceneBatch> {
     let raw = view.image.load().await?;
-    let sample = view_to_sample_image(raw, view.image.alpha_mode());
+    let alpha_mode = view.image.alpha_mode();
+    let sample = view_to_sample_image(raw, alpha_mode);
     let (target_w, target_h) = (sample.width(), sample.height());
+    // Measure coverage before `sample_to_packed_data` consumes the sample.
+    // Only masked views need it; a transparent view's alpha is supervised
+    // directly, and an opaque one has nothing to correct for.
+    let alpha_coverage = (alpha_mode == AlphaMode::Masked && sample.color().has_alpha())
+        .then(|| mean_alpha(&sample));
     let (img_packed, has_alpha) = sample_to_packed_data(sample);
     let normal_data = match view.image.load_normal(target_w, target_h).await {
         Some(Ok(img)) => Some(normal_sample_to_data(img)),
@@ -144,7 +151,8 @@ pub async fn load_view_batch(view: &SceneView) -> image::ImageResult<SceneBatch>
     Ok(SceneBatch {
         img_packed,
         has_alpha,
-        alpha_mode: view.image.alpha_mode(),
+        alpha_mode,
+        alpha_coverage,
         camera: view.camera,
         normal_data,
     })

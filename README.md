@@ -28,6 +28,11 @@ It also supports masking images:
 - Images with transparency. This will force the final splat to match the transparency of the input.
 - A folder of images called 'masks'. This ignores parts of the image that are masked out.
 
+Both interpretations can coexist in a single run — the mode is resolved per view from
+whether that image has a `masks/` sidecar — see
+[docs/mixed-alpha-modes.md](docs/mixed-alpha-modes.md) for the layout, the
+`--alpha-mode` override caveat, and `--normalize-masked-loss`.
+
 Optionally, training can also be supervised with monocular normal maps (e.g. from Sapiens2) via a
 folder of images called 'normals' — see [docs/normal-supervision.md](docs/normal-supervision.md)
 for the dataset format and `--normal-loss-weight`/`--normal-loss-start-iter` CLI flags.

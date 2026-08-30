@@ -213,6 +213,24 @@ impl DatasetPanel {
     }
 }
 
+impl DatasetPanel {
+    /// Count views by alpha mode in the currently-selected scene, but only when
+    /// the scene actually mixes them. A run may legitimately carry both — alpha
+    /// meaning "ignore this region" on some frames and "nothing is here" on
+    /// others — and the split is otherwise invisible without scrubbing every
+    /// view one at a time.
+    fn mixed_mode_counts(&self) -> Option<(usize, usize)> {
+        let scene = selected_scene(self.view_type, &self.cur_dataset);
+        let masked = scene
+            .views
+            .iter()
+            .filter(|v| v.image.alpha_mode() == AlphaMode::Masked)
+            .count();
+        let transparent = scene.views.len() - masked;
+        (masked > 0 && transparent > 0).then_some((masked, transparent))
+    }
+}
+
 impl AppPane for DatasetPanel {
     fn title(&self) -> egui::WidgetText {
         let Some((view, tex)) = self.displayed.as_ref() else {
@@ -252,6 +270,16 @@ impl AppPane for DatasetPanel {
                 ..Default::default()
             },
         );
+        if let Some((masked, transparent)) = self.mixed_mode_counts() {
+            job.append(
+                &format!("  |  mixed: {masked} masked, {transparent} rgba"),
+                0.0,
+                egui::TextFormat {
+                    color: Color32::from_rgb(190, 170, 110),
+                    ..Default::default()
+                },
+            );
+        }
         job.into()
     }
 

@@ -2,7 +2,7 @@
 use std::path::Path;
 
 use anyhow::Result;
-use brush_dataset::scene::{sample_to_packed_data, view_to_sample_image};
+use brush_dataset::scene::{mean_alpha, sample_to_packed_data, view_to_sample_image};
 use brush_loss::{ImageLossConfig, image_loss_eval};
 use brush_render::camera::Camera;
 use brush_render::gaussian_splats::Splats;
@@ -19,17 +19,33 @@ pub struct EvalSample {
     pub render_aux: RenderAux,
 }
 
+/// `normalize_masked` mirrors the trainer's `normalize_masked_loss`: on a
+/// [`AlphaMode::Masked`] view it scores only the masked region (weighting the
+/// residual by `gt.a` and dividing by mask coverage) instead of the whole
+/// frame. Without it, a masked view's PSNR is diluted by background the model
+/// was never asked to fit, which makes metrics incomparable across views in a
+/// run that mixes alpha modes. Off by default so existing numbers don't shift.
 pub async fn eval_stats(
     splats: Splats,
     gt_cam: &Camera,
     gt_img: DynamicImage,
     alpha_mode: AlphaMode,
+    normalize_masked: bool,
     device: &Device,
 ) -> Result<EvalSample> {
     let res = glam::uvec2(gt_img.width(), gt_img.height());
 
-    let (gt_packed_data, _has_alpha) =
-        sample_to_packed_data(view_to_sample_image(gt_img.clone(), alpha_mode));
+    let sample = view_to_sample_image(gt_img.clone(), alpha_mode);
+    // Exact for binary masks: the mse path squares the already-`a`-weighted
+    // residual, and `a^2 == a` only when `a` is 0 or 1. Soft masks are
+    // approximated (they weight by `a^2` while dividing by mean `a`).
+    let masked = normalize_masked && alpha_mode == AlphaMode::Masked && sample.color().has_alpha();
+    let coverage = if masked {
+        mean_alpha(&sample).max(crate::train::MIN_MASK_COVERAGE)
+    } else {
+        1.0
+    };
+    let (gt_packed_data, _has_alpha) = sample_to_packed_data(sample);
     let gt_packed: Tensor<2, Int> = Tensor::from_data(gt_packed_data, device);
 
     // Render on reference black background.
@@ -44,14 +60,16 @@ pub async fn eval_stats(
         l1_weight: l1,
         ssim_weight: ssim,
         composite_bg: None,
-        mask: false,
+        mask: masked,
     };
-    // MSE = mean(L1^2) since |a - b|^2 == (a - b)^2.
+    // MSE = mean(L1^2) since |a - b|^2 == (a - b)^2. Dividing by coverage turns
+    // the whole-frame mean into a mean over the masked region.
     let mse = image_loss_eval(render_rgb.clone(), gt_packed.clone(), cfg(1.0, 0.0))
         .powi_scalar(2)
-        .mean();
+        .mean()
+        / coverage;
     let psnr = mse.recip().log() * 10.0 / std::f32::consts::LN_10;
-    let ssim = image_loss_eval(render_rgb.clone(), gt_packed, cfg(0.0, 1.0)).mean();
+    let ssim = image_loss_eval(render_rgb.clone(), gt_packed, cfg(0.0, 1.0)).mean() / coverage;
 
     Ok(EvalSample {
         gt_img,

@@ -1,4 +1,5 @@
 use crate::{Dataset, config::LoadDatasetConfig, scene::SceneView};
+use brush_render::AlphaMode;
 use brush_serde::{DeserializeError, SplatMessage, load_splat_from_ply};
 
 use brush_vfs::BrushVfs;
@@ -71,7 +72,7 @@ pub async fn load_dataset(
         return Err(DatasetError::FormatNotSupported);
     };
 
-    let result = dataset?;
+    let mut result = dataset?;
 
     // A dataset that parsed but has no usable training views (e.g. every image
     // was missing or filtered out) would otherwise "load" and then crash on the
@@ -83,6 +84,8 @@ pub async fn load_dataset(
         )
         .into());
     }
+
+    report_alpha_modes(&result.dataset, load_args, &mut result.warnings);
 
     // If there's an initial ply file, override the init stream with that.
     let mut ply_paths: Vec<_> = vfs.files_with_extension("ply").collect();
@@ -109,6 +112,53 @@ pub async fn load_dataset(
         dataset: result.dataset,
         warnings: result.warnings,
     })
+}
+
+/// Log how the dataset's views resolved to alpha modes, and warn when an
+/// explicit `--alpha-mode` is flattening a mix the `masks/` sidecar layout
+/// would otherwise have produced.
+///
+/// A run can legitimately mix modes — some frames' alpha means "ignore this
+/// region" (masked), others' means "nothing is here" (transparent) — and the
+/// trainer handles that per view. The failure mode this guards against is
+/// silent: passing `--alpha-mode` forces every view, so a carefully prepared
+/// mix collapses to one interpretation with nothing in the log to say so.
+fn report_alpha_modes(
+    dataset: &Dataset,
+    load_args: &LoadDatasetConfig,
+    warnings: &mut Vec<String>,
+) {
+    let views = || {
+        dataset
+            .train
+            .views
+            .iter()
+            .chain(dataset.eval.iter().flat_map(|s| s.views.iter()))
+    };
+
+    let (mut masked, mut transparent) = (0usize, 0usize);
+    for view in views() {
+        match view.image.alpha_mode() {
+            AlphaMode::Masked => masked += 1,
+            AlphaMode::Transparent => transparent += 1,
+        }
+    }
+    log::info!("Dataset alpha modes: {masked} masked, {transparent} transparent view(s)");
+
+    if let Some(forced) = load_args.alpha_mode {
+        let with_sidecar = views().filter(|v| v.image.has_mask_sidecar()).count();
+        let total = masked + transparent;
+        // A mix is only *implied* when the sidecars disagree with each other:
+        // some views have one and some don't.
+        if with_sidecar > 0 && with_sidecar < total {
+            warnings.push(format!(
+                "--alpha-mode forced all {total} views to {forced:?}, but {with_sidecar} of them \
+                 have a masks/ sidecar and {} do not — without the flag those would have loaded \
+                 as masked and transparent respectively. Drop --alpha-mode to train on the mix.",
+                total - with_sidecar,
+            ));
+        }
+    }
 }
 
 /// Resolve a bare image name (as stored by colmap / `RealityCapture`, which only
@@ -225,6 +275,55 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
     use wasm_bindgen_test::wasm_bindgen_test;
+
+    /// A dataset may legitimately mix alpha modes: alpha means "ignore this
+    /// region" on frames that carry a `masks/` sidecar, and "nothing is here"
+    /// on frames whose alpha is embedded in the image itself. The sidecar
+    /// layout alone decides, per view, which is which.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn mixed_mask_layout_resolves_per_view_alpha_modes() {
+        let vfs = Arc::new(BrushVfs::create_test_vfs(vec![
+            PathBuf::from("images/masked.png"),
+            PathBuf::from("images/transparent.png"),
+            PathBuf::from("masks/masked.png"),
+        ]));
+
+        let mode = |name: &str| {
+            let path = PathBuf::from(format!("images/{name}.png"));
+            let mask = find_mask_path(&vfs, &path).map(Path::to_path_buf);
+            crate::scene::LoadImage::new(vfs.clone(), path, mask, 1920, None).alpha_mode()
+        };
+
+        assert_eq!(mode("masked"), AlphaMode::Masked);
+        assert_eq!(mode("transparent"), AlphaMode::Transparent);
+    }
+
+    /// `--alpha-mode` is a global force, not a per-view default: it overrides
+    /// the sidecar signal for every view. The b2crunner pipeline depends on
+    /// this (it writes alpha into `masks/` then passes `--alpha-mode
+    /// transparent`), which is why `report_alpha_modes` warns instead of
+    /// changing the precedence.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn explicit_alpha_mode_overrides_the_sidecar_signal() {
+        let vfs = Arc::new(BrushVfs::create_test_vfs(vec![
+            PathBuf::from("images/masked.png"),
+            PathBuf::from("masks/masked.png"),
+        ]));
+        let path = PathBuf::from("images/masked.png");
+        let mask = find_mask_path(&vfs, &path).map(Path::to_path_buf);
+
+        for forced in [AlphaMode::Masked, AlphaMode::Transparent] {
+            let image = crate::scene::LoadImage::new(
+                vfs.clone(),
+                path.clone(),
+                mask.clone(),
+                1920,
+                Some(forced),
+            );
+            assert_eq!(image.alpha_mode(), forced);
+            assert!(image.has_mask_sidecar());
+        }
+    }
 
     #[wasm_bindgen_test(unsupported = test)]
     fn test_find_mask() {

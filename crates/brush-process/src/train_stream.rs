@@ -375,6 +375,7 @@ pub(crate) async fn train_stream(
                 eval_scene,
                 save_path,
                 train_stream_config.rerun_config.rerun_max_img_size,
+                train_stream_config.train_config.normalize_masked_loss,
             )
             .await
             .with_context(|| format!("Failed evaluation at iteration {iter}"));
@@ -572,6 +573,7 @@ async fn run_eval(
     eval_scene: &Scene,
     save_path: Option<PathBuf>,
     rerun_max_img_size: u32,
+    normalize_masked: bool,
 ) -> Result<(), anyhow::Error> {
     if eval_scene.views.is_empty() {
         return Ok(());
@@ -591,6 +593,7 @@ async fn run_eval(
             &view.camera,
             eval_img,
             view.image.alpha_mode(),
+            normalize_masked,
             device,
         )
         .await

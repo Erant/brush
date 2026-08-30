@@ -128,6 +128,41 @@ pub fn sample_to_packed_data(sample: DynamicImage) -> (TensorData, bool) {
     (TensorData::new(packed, [h as usize, w as usize]), has_alpha)
 }
 
+/// Mean of the sample's alpha channel, in `[0, 1]` — i.e. the fraction of the
+/// frame the mask covers. Returns `1.0` for a sample with no alpha channel
+/// (every pixel is implicitly opaque).
+///
+/// Used to normalise a masked view's loss: the loss kernel multiplies each
+/// pixel by `gt.a` but the trainer averages over the *whole* frame, so a view
+/// with a small mask otherwise contributes proportionally less gradient than a
+/// transparent view of the same subject. Computed on the CPU at load time and
+/// cached with the batch, so it costs one linear scan per view for the whole
+/// run rather than a per-step GPU reduction.
+pub fn mean_alpha(sample: &DynamicImage) -> f32 {
+    let _span = tracing::trace_span!("mean_alpha").entered();
+    if !sample.color().has_alpha() {
+        return 1.0;
+    }
+    let n = (sample.width() as u64) * (sample.height() as u64);
+    if n == 0 {
+        return 1.0;
+    }
+    // Borrow the buffer for the RGBA8 case (what the loader always hands us);
+    // `to_rgba8` would clone it, ~33 MB per 4K frame across every loader task.
+    // Rarer alpha layouts (Rgba16, LumaA8, ...) fall back to the conversion.
+    let converted;
+    let raw = match sample {
+        DynamicImage::ImageRgba8(img) => img.as_raw(),
+        other => {
+            converted = other.to_rgba8();
+            converted.as_raw()
+        }
+    };
+    // Sum in u64: a 4K frame is ~8.3M px * 255, which overflows u32 handily.
+    let total: u64 = raw.chunks_exact(4).map(|px| u64::from(px[3])).sum();
+    total as f32 / (n as f32 * 255.0)
+}
+
 /// Convert a decoded monocular normal-map image into packed `[H, W]` RGBA data:
 /// RGB is the `(n+1)/2 * 255` encoded unit normal (camera space), A is the
 /// foreground mask baked into the source PNG's alpha channel. Kept as raw
@@ -149,6 +184,11 @@ pub struct SceneBatch {
     /// should consume (mask weight, alpha-matching loss, bg compositing).
     pub has_alpha: bool,
     pub alpha_mode: AlphaMode,
+    /// Fraction of the frame the mask covers (mean of `gt.a` in `[0, 1]`), for
+    /// [`AlphaMode::Masked`] views that carry a real alpha channel. `None`
+    /// otherwise — transparent and opaque views need no coverage correction.
+    /// Consumed by the trainer's `normalize_masked_loss` path.
+    pub alpha_coverage: Option<f32>,
     pub camera: Camera,
     /// Packed `[H, W]` RGBA monocular normal-map data (see
     /// [`normal_sample_to_data`]; decoded to f32 on the GPU by the normal
@@ -166,7 +206,7 @@ impl SceneBatch {
 
 #[cfg(test)]
 mod tests {
-    use super::{normal_sample_to_data, sample_to_packed_data};
+    use super::{mean_alpha, normal_sample_to_data, sample_to_packed_data};
     use image::{DynamicImage, ImageBuffer, RgbImage, RgbaImage};
 
     #[test]
@@ -185,6 +225,32 @@ mod tests {
     }
 
     #[test]
+    fn mean_alpha_measures_mask_coverage() {
+        // Two of four pixels fully masked in, one half, one out: 2.5 / 4.
+        let image = RgbaImage::from_raw(
+            4,
+            1,
+            vec![0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 128, 0, 0, 0, 0],
+        )
+        .expect("valid RGBA image");
+
+        let coverage = mean_alpha(&DynamicImage::ImageRgba8(image));
+
+        assert!(
+            (coverage - (255.0 + 255.0 + 128.0) / (4.0 * 255.0)).abs() < 1e-6,
+            "got {coverage}"
+        );
+    }
+
+    #[test]
+    fn mean_alpha_is_one_without_an_alpha_channel() {
+        let image: RgbImage =
+            ImageBuffer::from_raw(2, 1, vec![9, 10, 11, 12, 13, 14]).expect("valid RGB image");
+
+        assert_eq!(mean_alpha(&DynamicImage::ImageRgb8(image)), 1.0);
+    }
+
+    #[test]
     fn fills_missing_alpha_with_opaque_for_rgb_samples() {
         let image: RgbImage =
             ImageBuffer::from_raw(2, 1, vec![9, 10, 11, 12, 13, 14]).expect("valid RGB image");
@@ -199,12 +265,14 @@ mod tests {
         );
     }
 
-
     #[test]
     fn packs_normal_rgba_for_fused_gpu_loss() {
         let image = RgbaImage::from_raw(2, 1, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
         let packed = normal_sample_to_data(DynamicImage::ImageRgba8(image));
         assert_eq!(packed.shape.dims(), [1, 2]);
-        assert_eq!(packed.as_slice::<i32>().unwrap(), &[0x0403_0201, 0x0807_0605]);
+        assert_eq!(
+            packed.as_slice::<i32>().unwrap(),
+            &[0x0403_0201, 0x0807_0605]
+        );
     }
 }

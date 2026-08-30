@@ -58,6 +58,8 @@ fn half_masked_batch(camera: Camera) -> SceneBatch {
         img_packed: TensorData::new(packed, [H as usize, W as usize]),
         has_alpha: true,
         alpha_mode: AlphaMode::Masked,
+        // Exactly half the frame is masked in.
+        alpha_coverage: Some(0.5),
         camera,
         normal_data: None,
     }
