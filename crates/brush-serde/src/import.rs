@@ -23,6 +23,20 @@ pub struct ParseMetadata {
     pub progress: f32,
 }
 
+/// Number of floats per vertex in the optional per-splat evidence block
+/// (see [`EVIDENCE_FIELDS`]).
+pub const EVIDENCE_STRIDE: usize = 7;
+
+/// Property names of the optional per-splat multi-view evidence block that
+/// brush's trainer can append to a ply (`--export-evidence`) and that
+/// `brush-splat-render` turns into a per-view confidence. Layout, per vertex:
+/// in-mask contribution mass, total contribution mass, mass-weighted
+/// residual, number of supporting views, and the (unnormalised) resultant of
+/// observation directions. See `docs/splat-confidence.md`.
+pub const EVIDENCE_FIELDS: [&str; EVIDENCE_STRIDE] = [
+    "ev_w_in", "ev_w_all", "ev_err", "ev_views", "ev_dir_0", "ev_dir_1", "ev_dir_2",
+];
+
 /// Raw splat data parsed from a PLY file.
 /// Fields are optional - only positions are guaranteed.
 #[derive(Clone)]
@@ -33,6 +47,10 @@ pub struct SplatData {
     pub log_scales: Option<Vec<f32>>,
     pub sh_coeffs: Option<Vec<f32>>,
     pub raw_opacities: Option<Vec<f32>>,
+    /// Optional per-splat evidence block, `EVIDENCE_STRIDE` floats per splat
+    /// in [`EVIDENCE_FIELDS`] order. Present iff the ply carried `ev_*`
+    /// properties.
+    pub evidence: Option<Vec<f32>>,
 }
 
 impl SplatData {
@@ -70,6 +88,7 @@ impl SplatData {
             log_scales: self.log_scales.as_deref().map(|v| pick(v, 3)),
             sh_coeffs: self.sh_coeffs.as_deref().map(|v| pick(v, sh_stride)),
             raw_opacities: self.raw_opacities.as_deref().map(|v| pick(v, 1)),
+            evidence: self.evidence.as_deref().map(|v| pick(v, EVIDENCE_STRIDE)),
         }
     }
 
@@ -336,6 +355,9 @@ async fn parse_ply<T: AsyncRead + Unpin>(
         raw_opacities: vertex
             .has_property("opacity")
             .then(|| vec_exact(max_splats)),
+        evidence: vertex
+            .has_property(EVIDENCE_FIELDS[0])
+            .then(|| vec_exact(max_splats * EVIDENCE_STRIDE)),
     };
 
     let mut row_index: usize = 0;
@@ -377,6 +399,9 @@ async fn parse_ply<T: AsyncRead + Unpin>(
             }
             if let Some(opacity) = &mut data.raw_opacities {
                 opacity.push(gauss.opacity);
+            }
+            if let Some(evidence) = &mut data.evidence {
+                evidence.extend(gauss.evidence().map(|v| v.unwrap_or(0.0)));
             }
         })
         .deserialize(&mut *file)?;
@@ -541,6 +566,7 @@ async fn parse_compressed_ply<T: AsyncRead + Unpin>(
                 log_scales: Some(log_scales.clone()),
                 sh_coeffs: Some(sh_coeffs.clone()),
                 raw_opacities: Some(opacity.clone()),
+                evidence: None,
             };
             emitter.emit(SplatMessage { meta, data }).await;
         }
@@ -590,6 +616,7 @@ async fn parse_compressed_ply<T: AsyncRead + Unpin>(
             log_scales: Some(log_scales),
             sh_coeffs: Some(total_coeffs),
             raw_opacities: Some(opacity),
+            evidence: None,
         };
         emitter.emit(SplatMessage { meta, data }).await;
     }
@@ -679,6 +706,7 @@ mod tests {
             log_scales: Some(make(3)),
             sh_coeffs: Some(make(6)),
             raw_opacities: Some(make(1)),
+            evidence: Some(make(EVIDENCE_STRIDE)),
         };
 
         // Within budget: untouched.

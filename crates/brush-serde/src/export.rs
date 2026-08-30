@@ -1,5 +1,6 @@
 use std::vec;
 
+use crate::import::{EVIDENCE_FIELDS, EVIDENCE_STRIDE};
 use brush_render::gaussian_splats::Splats;
 use brush_render::sh::sh_coeffs_for_degree;
 use burn::tensor::Transaction;
@@ -37,6 +38,8 @@ struct DynamicPlyGaussian {
     f_dc_1: f32,
     f_dc_2: f32,
     rest_coeffs: Vec<f32>,
+    /// Optional per-splat evidence block (`EVIDENCE_FIELDS` order).
+    evidence: Option<[f32; EVIDENCE_STRIDE]>,
 }
 
 impl Serialize for DynamicPlyGaussian {
@@ -44,8 +47,8 @@ impl Serialize for DynamicPlyGaussian {
     where
         S: Serializer,
     {
-        // Calculate total number of fields: 11 core + 3 DC + rest_coeffs
-        let field_count = 14 + self.rest_coeffs.len();
+        // Calculate total number of fields: 11 core + 3 DC + rest_coeffs + evidence
+        let field_count = 14 + self.rest_coeffs.len() + self.evidence.map_or(0, |e| e.len());
         let mut state = serializer.serialize_struct("DynamicPlyGaussian", field_count)?;
 
         state.serialize_field("x", &self.x)?;
@@ -71,6 +74,12 @@ impl Serialize for DynamicPlyGaussian {
             state.serialize_field(name, val)?;
         }
 
+        if let Some(evidence) = &self.evidence {
+            for (name, val) in EVIDENCE_FIELDS.iter().zip(evidence) {
+                state.serialize_field(name, val)?;
+            }
+        }
+
         state.end()
     }
 }
@@ -80,7 +89,17 @@ struct DynamicPly {
     vertex: Vec<DynamicPlyGaussian>,
 }
 
-async fn read_splat_data(splats: Splats) -> Result<DynamicPly, ExportError> {
+async fn read_splat_data(
+    splats: Splats,
+    evidence: Option<&[f32]>,
+) -> Result<DynamicPly, ExportError> {
+    if let Some(ev) = evidence {
+        assert_eq!(
+            ev.len(),
+            splats.num_splats() as usize * EVIDENCE_STRIDE,
+            "evidence block must hold EVIDENCE_STRIDE floats per splat"
+        );
+    }
     let data = Transaction::default()
         .register(splats.transforms.val())
         .register(splats.raw_opacities.val())
@@ -171,6 +190,11 @@ async fn read_splat_data(splats: Splats) -> Result<DynamicPly, ExportError> {
                 f_dc_1: sh_green[0],
                 f_dc_2: sh_blue[0],
                 rest_coeffs,
+                evidence: evidence.map(|ev| {
+                    ev[i * EVIDENCE_STRIDE..(i + 1) * EVIDENCE_STRIDE]
+                        .try_into()
+                        .expect("evidence stride")
+                }),
             }
         })
         .collect();
@@ -178,11 +202,22 @@ async fn read_splat_data(splats: Splats) -> Result<DynamicPly, ExportError> {
 }
 
 pub async fn splat_to_ply(splats: Splats, up_axis: Option<Vec3>) -> Result<Vec<u8>, ExportError> {
+    splat_to_ply_with_evidence(splats, up_axis, None).await
+}
+
+/// Like [`splat_to_ply`], optionally appending a per-splat evidence block
+/// (`EVIDENCE_STRIDE` floats per splat, [`EVIDENCE_FIELDS`] order) as extra
+/// vertex properties. Indices must line up with `splats`.
+pub async fn splat_to_ply_with_evidence(
+    splats: Splats,
+    up_axis: Option<Vec3>,
+    evidence: Option<&[f32]>,
+) -> Result<Vec<u8>, ExportError> {
     // Fold any 3D-filter floor into the stored scales/opacity so the ply holds
     // ordinary derived values — the floor is never written as a separate field.
     let splats = splats.bake_min_scale();
     let sh_degree = splats.sh_degree();
-    let ply = read_splat_data(splats.clone()).await?;
+    let ply = read_splat_data(splats.clone(), evidence).await?;
 
     let render_mode_str = if splats.render_mip { "mip" } else { "default" };
 
@@ -248,7 +283,7 @@ mod tests {
             let splats = create_test_splats(degree);
             assert_eq!(splats.sh_degree(), degree);
 
-            let ply_data = read_splat_data(splats.clone()).await.unwrap();
+            let ply_data = read_splat_data(splats.clone(), None).await.unwrap();
             let expected_rest_coeffs = if degree == 0 {
                 0
             } else {

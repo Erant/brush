@@ -48,6 +48,21 @@ pub struct ProcessConfig {
         default_value = "export_{iter}.ply"
     )]
     pub export_name: String,
+    /// At the end of training, measure per-splat multi-view evidence against every
+    /// training view and write it into the final ply as `ev_*` vertex properties, so
+    /// `brush-splat-render --confidence` can gate novel views without the dataset.
+    /// See docs/splat-confidence.md.
+    #[arg(long, help_heading = "Process options", default_value = "false")]
+    pub export_evidence: bool,
+    /// Before the final export, drop splats whose in-mask contribution fraction
+    /// (evidence `w_in / w_all`) is below this value, or that no training view
+    /// supported at all. Implies computing evidence. Off when unset.
+    #[arg(long, help_heading = "Process options")]
+    pub evidence_prune_inmask: Option<f32>,
+    /// Weight of the normal-map residual folded into the evidence residual when the
+    /// dataset has `normals/`. 0 skips the extra normal render.
+    #[arg(long, help_heading = "Process options", default_value = "0.0")]
+    pub evidence_normal_weight: f32,
 }
 
 #[derive(Parser, Clone, Serialize, Deserialize)]

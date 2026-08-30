@@ -370,6 +370,33 @@ pub async fn render_splats(
     splat_scale: Option<f32>,
     texture_mode: TextureMode,
 ) -> (Tensor<3>, RenderAux) {
+    render_splats_with_features(
+        splats,
+        camera,
+        img_size,
+        background,
+        splat_scale,
+        texture_mode,
+        None,
+    )
+    .await
+}
+
+/// Like [`render_splats`], optionally alpha-compositing a `[N, 3]` per-splat
+/// feature tensor into three extra output channels (image becomes
+/// `[H, W, 7]`: RGBA + features, features signed and with no background
+/// contribution). Non-differentiable counterpart of
+/// `brush_render::bwd::render_splats_with_features`. Features require
+/// [`TextureMode::Float`].
+pub async fn render_splats_with_features(
+    splats: Splats,
+    camera: &Camera,
+    img_size: glam::UVec2,
+    background: Vec3,
+    splat_scale: Option<f32>,
+    texture_mode: TextureMode,
+    features: Option<Tensor<2>>,
+) -> (Tensor<3>, RenderAux) {
     splats.clone().validate_values().await;
 
     let sh_coeffs = splats.sh_coeffs.into_value();
@@ -399,6 +426,10 @@ pub async fn render_splats(
     };
 
     let use_float = matches!(texture_mode, TextureMode::Float);
+    assert!(
+        features.is_none() || use_float,
+        "per-splat features require TextureMode::Float"
+    );
     let render_device = transforms.device();
 
     // Float mode needs `Backward` (f32 image + per-splat bookkeeping); Packed
@@ -422,9 +453,12 @@ pub async fn render_splats(
         // throwaway scalar the concrete backends ignore.
         Tensor::<1>::zeros([1], &render_device).into_dispatch(),
         // Rank-1 dummy disables the per-splat feature path (see
-        // `SplatOps::render`) — the viewer/eval render never composites
-        // features.
-        Tensor::<1>::zeros([1], &render_device).into_dispatch(),
+        // `SplatOps::render`); a `[N, 3]` tensor enables it. Unwrapped
+        // per-arm since the two ranks share no `Tensor<D>` type.
+        match features {
+            Some(f) => f.into_dispatch(),
+            None => Tensor::<1>::zeros([1], &render_device).into_dispatch(),
+        },
         render_mode,
         background,
         pass,

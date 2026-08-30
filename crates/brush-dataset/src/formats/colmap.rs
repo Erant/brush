@@ -279,6 +279,7 @@ async fn load_dataset_inner(
             log_scales: None,
             sh_coeffs: Some(colors),
             raw_opacities: None,
+            evidence: None,
         };
 
         Some(SplatMessage {

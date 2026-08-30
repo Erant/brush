@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod eval;
+pub mod evidence;
 pub mod lod;
 pub mod msg;
 pub mod train;

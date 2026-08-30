@@ -6,7 +6,10 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::{
     config::LoadDatasetConfig,
-    scene::{Scene, SceneBatch, normal_sample_to_data, sample_to_packed_data, view_to_sample_image},
+    scene::{
+        Scene, SceneBatch, SceneView, normal_sample_to_data, sample_to_packed_data,
+        view_to_sample_image,
+    },
 };
 
 /// Shared cache of GPU-ready scene batches. Each slot holds at most one
@@ -114,6 +117,39 @@ impl SceneLoader {
     }
 }
 
+/// Load one view's ground truth into a GPU-ready [`SceneBatch`]: decode and
+/// resize the frame, premultiply it in transparent alpha mode, pack RGBA into
+/// one `u32` per pixel, and pick up the sibling normal map when there is one.
+/// Shared by the training loader and by any pass that walks the dataset
+/// view-by-view outside training (e.g. the end-of-training evidence pass).
+pub async fn load_view_batch(view: &SceneView) -> image::ImageResult<SceneBatch> {
+    let raw = view.image.load().await?;
+    let sample = view_to_sample_image(raw, view.image.alpha_mode());
+    let (target_w, target_h) = (sample.width(), sample.height());
+    let (img_packed, has_alpha) = sample_to_packed_data(sample);
+    let normal_data = match view.image.load_normal(target_w, target_h).await {
+        Some(Ok(img)) => Some(normal_sample_to_data(img)),
+        Some(Err(e)) => {
+            // A corrupt normal map degrades that view to photometric-only
+            // supervision rather than killing the loader task (and with it
+            // the whole training run).
+            log::warn!(
+                "Failed to load normal map for {}: {e}",
+                view.image.path().display()
+            );
+            None
+        }
+        None => None,
+    };
+    Ok(SceneBatch {
+        img_packed,
+        has_alpha,
+        alpha_mode: view.image.alpha_mode(),
+        camera: view.camera,
+        normal_data,
+    })
+}
+
 async fn run_loader(
     views: Arc<Vec<crate::scene::SceneView>>,
     cache: Arc<Mutex<BatchCache>>,
@@ -134,35 +170,11 @@ async fn run_loader(
         let batch = if let Some(batch) = cache.lock().await.get(index) {
             batch
         } else {
-            let raw = view
-                .image
-                .load()
-                .await
-                .expect("Scene loader failed to load an image");
-            let sample = view_to_sample_image(raw, view.image.alpha_mode());
-            let (target_w, target_h) = (sample.width(), sample.height());
-            let (img_packed, has_alpha) = sample_to_packed_data(sample);
-            let normal_data = match view.image.load_normal(target_w, target_h).await {
-                Some(Ok(img)) => Some(normal_sample_to_data(img)),
-                Some(Err(e)) => {
-                    // A corrupt normal map degrades that view to
-                    // photometric-only supervision rather than killing the
-                    // loader task (and with it the whole training run).
-                    log::warn!(
-                        "Failed to load normal map for {}: {e}",
-                        view.image.path().display()
-                    );
-                    None
-                }
-                None => None,
-            };
-            let batch = Arc::new(SceneBatch {
-                img_packed,
-                has_alpha,
-                alpha_mode: view.image.alpha_mode(),
-                camera: view.camera,
-                normal_data,
-            });
+            let batch = Arc::new(
+                load_view_batch(view)
+                    .await
+                    .expect("Scene loader failed to load an image"),
+            );
             cache.lock().await.insert(index, batch.clone());
             batch
         };

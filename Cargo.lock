@@ -1286,9 +1286,12 @@ name = "brush-splat-render"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "brush-dataset",
  "brush-process",
  "brush-render",
  "brush-serde",
+ "brush-train",
+ "brush-vfs",
  "burn",
  "clap",
  "env_logger",

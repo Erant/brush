@@ -15,6 +15,9 @@ path = "src/main.rs"
 brush-render.path = "../brush-render"
 brush-serde.path = "../brush-serde"
 brush-process.path = "../brush-process"
+brush-train.path = "../brush-train"
+brush-dataset.path = "../brush-dataset"
+brush-vfs.path = "../brush-vfs"
 
 burn.workspace = true
 glam.workspace = true

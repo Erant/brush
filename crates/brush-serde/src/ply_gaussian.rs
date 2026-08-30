@@ -97,6 +97,38 @@ pub struct PlyGaussian {
     pub(crate) green: Option<f32>,
     #[serde(default, alias = "b", skip_serializing, deserialize_with = "de_quant")]
     pub(crate) blue: Option<f32>,
+
+    // Optional per-splat multi-view evidence written by brush's trainer
+    // (`crate::import::EVIDENCE_FIELDS`). Absent in ordinary plys.
+    #[serde(default)]
+    pub(crate) ev_w_in: Option<f32>,
+    #[serde(default)]
+    pub(crate) ev_w_all: Option<f32>,
+    #[serde(default)]
+    pub(crate) ev_err: Option<f32>,
+    #[serde(default)]
+    pub(crate) ev_views: Option<f32>,
+    #[serde(default)]
+    pub(crate) ev_dir_0: Option<f32>,
+    #[serde(default)]
+    pub(crate) ev_dir_1: Option<f32>,
+    #[serde(default)]
+    pub(crate) ev_dir_2: Option<f32>,
+}
+
+impl PlyGaussian {
+    /// The evidence block in [`crate::import::EVIDENCE_FIELDS`] order.
+    pub(crate) fn evidence(&self) -> [Option<f32>; crate::import::EVIDENCE_STRIDE] {
+        [
+            self.ev_w_in,
+            self.ev_w_all,
+            self.ev_err,
+            self.ev_views,
+            self.ev_dir_0,
+            self.ev_dir_1,
+            self.ev_dir_2,
+        ]
+    }
 }
 
 // Generate the sh_rest_coeffs() method using proc macro

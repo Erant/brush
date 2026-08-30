@@ -12,6 +12,7 @@ use brush_rerun::visualize_tools::VisualizeTools;
 use brush_train::{
     RandomSplatsConfig, create_random_splats,
     eval::eval_stats,
+    evidence::{SplatEvidence, compute_evidence, prune_by_inmask},
     lod::{compute_pup_scores, decimate_to_count},
     msg::RefineStats,
     to_init_splats,
@@ -250,6 +251,7 @@ pub(crate) async fn train_stream(
                     exp_iter,
                     exp_total,
                     up_axis,
+                    None,
                 )
                 .await
                 .with_context(|| "Export at LOD boundary failed");
@@ -399,6 +401,56 @@ pub(crate) async fn train_stream(
                         .replace(".ply", &format!("_lod{current_lod}.ply"));
                     (lod_name, lod_refine_steps, lod_refine_steps)
                 };
+
+                // Final export only: measure per-splat multi-view evidence
+                // against the training views (refine never runs on the last
+                // step, so indices stay aligned with what gets written),
+                // optionally prune on it, and write it into the ply.
+                let want_evidence = process_config.export_evidence
+                    || process_config.evidence_prune_inmask.is_some();
+                let mut evidence: Option<SplatEvidence> = None;
+                if is_last_step && current_lod == 0 && want_evidence {
+                    let start = Instant::now();
+                    match compute_evidence(
+                        &splats,
+                        &dataset.train,
+                        &device,
+                        process_config.evidence_normal_weight,
+                    )
+                    .await
+                    {
+                        Ok(ev) => {
+                            log::info!(
+                                "Computed evidence for {} splats over {} views in {:.1}s",
+                                ev.len(),
+                                dataset.train.views.len(),
+                                start.elapsed().as_secs_f32()
+                            );
+                            if let Some(min_inmask) = process_config.evidence_prune_inmask {
+                                let before = splats.num_splats();
+                                let (pruned, ev) = prune_by_inmask(splats.clone(), &ev, min_inmask);
+                                splats = pruned;
+                                slot.set(0, splats.clone());
+                                log::info!(
+                                    "Evidence prune (inmask < {min_inmask}): {before} -> {} splats",
+                                    splats.num_splats()
+                                );
+                                evidence = Some(ev);
+                            } else {
+                                evidence = Some(ev);
+                            }
+                        }
+                        Err(error) => {
+                            emitter
+                                .emit(ProcessMessage::Warning {
+                                    error: error.context("Computing splat evidence failed"),
+                                })
+                                .await;
+                        }
+                    }
+                }
+                let evidence_flat = evidence.as_ref().map(SplatEvidence::to_flat);
+
                 let res = export_checkpoint(
                     splats.clone(),
                     &export_path,
@@ -406,6 +458,7 @@ pub(crate) async fn train_stream(
                     exp_iter,
                     exp_total,
                     up_axis,
+                    evidence_flat.as_deref(),
                 )
                 .await
                 .with_context(|| format!("Export at iteration {iter} failed"));
@@ -587,13 +640,14 @@ async fn export_checkpoint(
     iter: u32,
     total_steps: u32,
     up_axis: Option<glam::Vec3>,
+    evidence: Option<&[f32]>,
 ) -> Result<(), anyhow::Error> {
     tokio::fs::create_dir_all(&export_path)
         .await
         .with_context(|| format!("Creating export directory {}", export_path.display()))?;
     let digits = ((total_steps as f64).log10().floor() as usize) + 1;
     let export_name = export_name.replace("{iter}", &format!("{iter:0digits$}"));
-    let splat_data = brush_serde::splat_to_ply(splats, up_axis)
+    let splat_data = brush_serde::splat_to_ply_with_evidence(splats, up_axis, evidence)
         .await
         .context("Serializing splat data")?;
     tokio::fs::write(export_path.join(&export_name), splat_data)

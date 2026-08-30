@@ -1261,6 +1261,16 @@ pub fn normal_loss(pred: Tensor<3>, gt_packed: Tensor<2, Int>) -> Tensor<1> {
     (loss / count).reshape([1])
 }
 
+/// Forward-only counterpart of [`normal_loss`] for non-differentiable
+/// backends: the raw `[2, H, W]` map (plane 0 = per-pixel masked
+/// `L1 + (1 - cos)`, plane 1 = 1 where the GT mask is set, else 0).
+pub fn normal_loss_eval(pred: Tensor<3>, gt_packed: Tensor<2, Int>) -> Tensor<3> {
+    let pred_p = unwrap_wgpu_float(pred.permute([2, 0, 1]));
+    let gt = unwrap_wgpu_int(gt_packed);
+    let map = <MainBackend as LossOps<MainBackend>>::normal_loss_forward(pred_p, gt);
+    wrap_wgpu_float::<3>(map)
+}
+
 /// L1 + SSIM image loss with optional bg-compositing and masking, all folded
 /// into a single fused kernel. Pass `pred` with 4 channels (RGBA) to also
 /// emit `|pred.a - gt.a|` into the alpha channel of the loss map; pass 3
