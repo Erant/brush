@@ -1244,8 +1244,21 @@ impl<B: Backend + LossOps<B>> Backward<B, 1> for NormalLossBackward {
 
 /// Masked L1 + cosine loss for camera-space normal supervision. GT is a
 /// packed RGBA image; decode, axis conversion, mask, forward and backward
-/// pixel math each execute in one GPU kernel.
+/// pixel math each execute in one GPU kernel. The mean of
+/// [`normal_loss_map`]'s residual plane over its mask plane.
 pub fn normal_loss(pred: Tensor<3>, gt_packed: Tensor<2, Int>) -> Tensor<1> {
+    let map = normal_loss_map(pred, gt_packed);
+    let loss = map.clone().slice(burn::tensor::s![0..1, .., ..]).sum();
+    let count = map.slice(burn::tensor::s![1..2, .., ..]).sum().clamp_min(1.0);
+    (loss / count).reshape([1])
+}
+
+/// The differentiable `[2, H, W]` map behind [`normal_loss`]: plane 0 is the
+/// per-pixel masked `L1 + (1 - cos)` residual, plane 1 is 1 where the GT mask
+/// is set and 0 elsewhere. Exposed so a caller can weight both planes per
+/// pixel (a `weights/` sidecar) before taking the masked mean; the
+/// reduction is `plane0.sum() / plane1.sum().clamp_min(1)`.
+pub fn normal_loss_map(pred: Tensor<3>, gt_packed: Tensor<2, Int>) -> Tensor<3> {
     let pred_ad = unwrap_ad_wgpu_float(pred.permute([2, 0, 1]));
     let gt = unwrap_wgpu_int(gt_packed);
     let prep = NormalLossBackward.prepare::<NoCheckpointing>([pred_ad.node.clone()]).compute_bound().stateful();
@@ -1255,10 +1268,7 @@ pub fn normal_loss(pred: Tensor<3>, gt_packed: Tensor<2, Int>) -> Tensor<1> {
         OpsKind::Tracked(prep) => prep.finish(NormalLossState { pred: pred_p, gt_packed: gt }, map),
         OpsKind::UnTracked(prep) => prep.finish(map),
     };
-    let map: Tensor<3> = wrap_ad_wgpu_float(map_ad);
-    let loss = map.clone().slice(burn::tensor::s![0..1, .., ..]).sum();
-    let count = map.slice(burn::tensor::s![1..2, .., ..]).sum().clamp_min(1.0);
-    (loss / count).reshape([1])
+    wrap_ad_wgpu_float(map_ad)
 }
 
 /// Forward-only counterpart of [`normal_loss`] for non-differentiable

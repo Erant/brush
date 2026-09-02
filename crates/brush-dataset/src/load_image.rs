@@ -14,6 +14,7 @@ pub struct LoadImage {
     path: PathBuf,
     mask_path: Option<PathBuf>,
     normal_path: Option<PathBuf>,
+    weight_path: Option<PathBuf>,
     max_resolution: u32,
     alpha_mode: AlphaMode,
     scale: f32,
@@ -24,6 +25,7 @@ impl PartialEq for LoadImage {
         self.path == other.path
             && self.mask_path == other.mask_path
             && self.normal_path == other.normal_path
+            && self.weight_path == other.weight_path
             && self.max_resolution == other.max_resolution
             && self.alpha_mode == other.alpha_mode
             && self.scale == other.scale
@@ -51,6 +53,7 @@ impl LoadImage {
             path,
             mask_path,
             normal_path: None,
+            weight_path: None,
             max_resolution,
             alpha_mode,
             scale: 1.0,
@@ -63,6 +66,15 @@ impl LoadImage {
     /// get a normal map back from [`Self::load_normal`].
     pub fn with_normal_path(mut self, normal_path: Option<PathBuf>) -> Self {
         self.normal_path = normal_path;
+        self
+    }
+
+    /// Attach a sibling per-pixel loss-weight path (from a `weights/`
+    /// directory), if one was found for this image. Absent by default, and
+    /// absent means a weight of 1 everywhere — [`Self::load_weight`] returns
+    /// `None` and the trainer applies nothing.
+    pub fn with_weight_path(mut self, weight_path: Option<PathBuf>) -> Self {
+        self.weight_path = weight_path;
         self
     }
 
@@ -164,6 +176,49 @@ impl LoadImage {
         }
     }
 
+    /// Load the sibling loss-weight image (if one was attached via
+    /// [`Self::with_weight_path`]), resized to exactly `target_w`x`target_h`
+    /// so it stays pixel-aligned with what [`Self::load`] produced. `None`
+    /// when the view has no weight map — "weight 1 everywhere", not an error.
+    ///
+    /// Resized with a triangle filter: a weight map is a smooth scalar
+    /// field, so blending neighbours is the right thing (unlike a normal
+    /// map, whose encoded vectors must not be averaged). The image is read
+    /// as greyscale; a colour or RGBA file is reduced to luma, and only its
+    /// colour channels matter — a weight map's own alpha is ignored.
+    pub async fn load_weight(
+        &self,
+        target_w: u32,
+        target_h: u32,
+    ) -> Option<image::ImageResult<DynamicImage>> {
+        let weight_path = self.weight_path.as_ref()?;
+        Some(
+            self.load_weight_inner(weight_path, target_w, target_h)
+                .await,
+        )
+    }
+
+    async fn load_weight_inner(
+        &self,
+        weight_path: &Path,
+        target_w: u32,
+        target_h: u32,
+    ) -> image::ImageResult<DynamicImage> {
+        let mut bytes = vec![];
+        self.vfs
+            .reader_at_path(weight_path)
+            .await?
+            .read_to_end(&mut bytes)
+            .await?;
+        let img = image::load_from_memory(&bytes)?;
+        let img = DynamicImage::ImageLuma8(img.to_luma8());
+        if img.width() == target_w && img.height() == target_h {
+            Ok(img)
+        } else {
+            Ok(img.resize_exact(target_w, target_h, image::imageops::FilterType::Triangle))
+        }
+    }
+
     /// Factor `load()` applies to a source of size `w`x`h`: the long edge is
     /// capped to `max_resolution` and multiplied by `scale`.
     fn output_scale(&self, w: u32, h: u32) -> f32 {
@@ -209,6 +264,12 @@ impl LoadImage {
     /// a mix the sidecar layout would otherwise have produced.
     pub fn has_mask_sidecar(&self) -> bool {
         self.mask_path.is_some()
+    }
+
+    /// Whether a `weights/` sidecar was found for this image (see
+    /// [`Self::load_weight`]). Read by the dataset loader's census.
+    pub fn has_weight_sidecar(&self) -> bool {
+        self.weight_path.is_some()
     }
 
     pub fn with_scale(mut self, scale: f32) -> Self {

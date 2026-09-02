@@ -9,7 +9,7 @@ use crate::{
     config::LoadDatasetConfig,
     scene::{
         Scene, SceneBatch, SceneView, mean_alpha, normal_sample_to_data, sample_to_packed_data,
-        view_to_sample_image,
+        view_to_sample_image, weight_sample_to_data,
     },
 };
 
@@ -46,7 +46,8 @@ impl BatchCache {
         // Track exact bytes: rounding to whole MB let sub-MB images slip in
         // for free and bypass the budget entirely.
         let normal_bytes = batch.normal_data.as_ref().map_or(0, |d| d.as_bytes().len());
-        let size_bytes: u64 = (batch.img_packed.as_bytes().len() + normal_bytes)
+        let weight_bytes = batch.loss_weight.as_ref().map_or(0, |d| d.as_bytes().len());
+        let size_bytes: u64 = (batch.img_packed.as_bytes().len() + normal_bytes + weight_bytes)
             .try_into()
             .expect("shouldn't exceed ~18 Exabytes...");
         if self.used_bytes + size_bytes < self.budget_bytes {
@@ -148,6 +149,21 @@ pub async fn load_view_batch(view: &SceneView) -> image::ImageResult<SceneBatch>
         }
         None => None,
     };
+    let loss_weight = match view.image.load_weight(target_w, target_h).await {
+        Some(Ok(img)) => Some(weight_sample_to_data(&img)),
+        Some(Err(e)) => {
+            // Same policy as a corrupt normal map: this view trains at full
+            // weight rather than taking the run down with it. Loud, because
+            // a weight map that silently drops out is exactly the kind of
+            // thing a training's output cannot reveal.
+            log::warn!(
+                "Failed to load loss-weight map for {}: {e}. The view trains at weight 1.",
+                view.image.path().display()
+            );
+            None
+        }
+        None => None,
+    };
     Ok(SceneBatch {
         img_packed,
         has_alpha,
@@ -155,6 +171,7 @@ pub async fn load_view_batch(view: &SceneView) -> image::ImageResult<SceneBatch>
         alpha_coverage,
         camera: view.camera,
         normal_data,
+        loss_weight,
     })
 }
 

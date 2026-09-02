@@ -129,6 +129,7 @@ fn generate_test_batch(resolution: (u32, u32)) -> SceneBatch {
         alpha_coverage: None,
         camera,
         normal_data: None,
+        loss_weight: None,
     }
 }
 
@@ -257,6 +258,7 @@ async fn train_with_zero_visible_does_not_crash() {
         alpha_coverage: None,
         camera,
         normal_data: None,
+        loss_weight: None,
     };
 
     let config = TrainConfig::default();

@@ -1,4 +1,7 @@
-use super::{DatasetLoadResult, FormatError, find_mask_path, find_normal_path, opengl_c2w_to_pose};
+use super::{
+    DatasetLoadResult, FormatError, find_mask_path, find_normal_path, find_weight_path,
+    opengl_c2w_to_pose,
+};
 use crate::{
     Dataset,
     config::LoadDatasetConfig,
@@ -185,6 +188,7 @@ async fn read_transforms_file(
         }
         let mask_path = find_mask_path(&vfs, &path).map(|p| p.to_path_buf());
         let normal_path = find_normal_path(&vfs, &path).map(|p| p.to_path_buf());
+        let weight_path = find_weight_path(&vfs, &path).map(|p| p.to_path_buf());
         let image = LoadImage::new(
             vfs.clone(),
             path,
@@ -192,7 +196,8 @@ async fn read_transforms_file(
             load_args.max_resolution,
             load_args.alpha_mode,
         )
-        .with_normal_path(normal_path);
+        .with_normal_path(normal_path)
+        .with_weight_path(weight_path);
 
         let w = frame.w.or(scene.w);
         let h = frame.h.or(scene.h);

@@ -139,6 +139,7 @@ fn generate_training_batch(resolution: (u32, u32), camera_pos: Vec3) -> SceneBat
         alpha_coverage: None,
         camera,
         normal_data: None,
+        loss_weight: None,
     }
 }
 

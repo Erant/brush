@@ -86,6 +86,7 @@ pub async fn load_dataset(
     }
 
     report_alpha_modes(&result.dataset, load_args, &mut result.warnings);
+    report_loss_weights(&result.dataset);
 
     // If there's an initial ply file, override the init stream with that.
     let mut ply_paths: Vec<_> = vfs.files_with_extension("ply").collect();
@@ -162,11 +163,31 @@ fn report_alpha_modes(
 }
 
 /// Resolve a bare image name (as stored by colmap / `RealityCapture`, which only
-/// record a filename) to a path in the VFS by brute-force suffix search. Masks
-/// are skipped so an image never resolves to its own mask.
+/// record a filename) to a path in the VFS by brute-force suffix search. The
+/// sidecar directories are skipped so an image never resolves to its own
+/// mask, normal map or weight map.
+/// Log how many views carry a `weights/` sidecar. Never a warning: a weight
+/// map is optional per view and means exactly what it says wherever it is
+/// present, so the only thing worth knowing is that the loader saw them.
+fn report_loss_weights(dataset: &Dataset) {
+    let weighted = dataset
+        .train
+        .views
+        .iter()
+        .chain(dataset.eval.iter().flat_map(|s| s.views.iter()))
+        .filter(|v| v.image.has_weight_sidecar())
+        .count();
+    if weighted > 0 {
+        log::info!("Dataset loss weights: {weighted} view(s) carry a weights/ sidecar");
+    }
+}
+
 fn find_image_by_name<'a>(vfs: &'a BrushVfs, name: &str) -> Option<&'a Path> {
     vfs.files_ending_in(name)
-        .filter(|p| !p.iter().any(|f| f == "masks"))
+        .filter(|p| {
+            !p.iter()
+                .any(|f| f == "masks" || f == "normals" || f == "weights")
+        })
         .min()
 }
 
@@ -197,12 +218,28 @@ fn split_eval_every(
     })
 }
 
-/// Find a sibling monocular normal-map image for `path`, by looking for a
-/// `normals/` directory whose subpath (relative to `path`'s own directory)
-/// matches, mirroring [`find_mask_path`]'s convention but for `normals`
-/// instead of `masks`, and without the `.mask` stem-suffix variant (not used
-/// by the normal-map dataset convention this targets).
+/// Find a sibling monocular normal-map image for `path`: a `normals/`
+/// directory whose subpath (relative to `path`'s own directory) matches.
+/// See [`find_sidecar_path`].
 fn find_normal_path<'a>(vfs: &'a BrushVfs, path: &'a Path) -> Option<&'a Path> {
+    find_sidecar_path(vfs, path, "normals")
+}
+
+/// Find a sibling per-pixel loss-weight image for `path`: a `weights/`
+/// directory laid out like `masks/`. A weight sidecar is a greyscale image
+/// in `[0, 1]` (0..255) that multiplies the view's loss map pixel by pixel,
+/// on top of whatever its alpha mode does — the one channel a transparent
+/// view otherwise lacks, since its alpha is a target rather than a weight.
+/// See `docs/loss-weights.md`.
+fn find_weight_path<'a>(vfs: &'a BrushVfs, path: &'a Path) -> Option<&'a Path> {
+    find_sidecar_path(vfs, path, "weights")
+}
+
+/// Find a sibling image for `path` under a `<dir>/` directory, mirroring
+/// [`find_mask_path`]'s convention (`img.png.*` or `img.*`, with the
+/// directory subpath after `<dir>/` matching the image's own) but without
+/// the `.mask` stem-suffix variant, which only the mask convention uses.
+fn find_sidecar_path<'a>(vfs: &'a BrushVfs, path: &'a Path, dir: &str) -> Option<&'a Path> {
     let search_name = path.file_name().expect("File must have a name");
     let search_stem = path.file_stem().expect("File must have a name");
 
@@ -212,16 +249,16 @@ fn find_normal_path<'a>(vfs: &'a BrushVfs, path: &'a Path) -> Option<&'a Path> {
         };
 
         if stem.eq_ignore_ascii_case(search_name) || stem.eq_ignore_ascii_case(search_stem) {
-            let normals_idx = candidate
+            let dir_idx = candidate
                 .components()
-                .position(|c| c.as_os_str().eq_ignore_ascii_case("normals"));
+                .position(|c| c.as_os_str().eq_ignore_ascii_case(dir));
 
-            normals_idx.is_some_and(|idx| {
+            dir_idx.is_some_and(|idx| {
                 let candidate_components: Vec<_> = candidate.components().collect();
                 let path_dir_components: Vec<_> = path.parent().unwrap().components().collect();
-                let normal_dir_subpath =
+                let sidecar_dir_subpath =
                     &candidate_components[idx + 1..candidate_components.len() - 1];
-                path_dir_components.ends_with(normal_dir_subpath)
+                path_dir_components.ends_with(sidecar_dir_subpath)
             })
         } else {
             false
@@ -296,6 +333,33 @@ mod tests {
 
         assert_eq!(mode("masked"), AlphaMode::Masked);
         assert_eq!(mode("transparent"), AlphaMode::Transparent);
+    }
+
+    /// A `weights/` sidecar is found the way a `normals/` one is — by name
+    /// or stem under a directory whose subpath mirrors the image's — and it
+    /// is orthogonal to the alpha mode: a transparent view keeps carving
+    /// the silhouette and additionally weights its loss.
+    #[wasm_bindgen_test(unsupported = test)]
+    fn weight_sidecars_are_found_and_leave_the_alpha_mode_alone() {
+        let vfs = Arc::new(BrushVfs::create_test_vfs(vec![
+            PathBuf::from("images/weighted.png"),
+            PathBuf::from("images/plain.png"),
+            PathBuf::from("weights/weighted.png"),
+        ]));
+
+        let image = PathBuf::from("images/weighted.png");
+        assert_eq!(
+            find_weight_path(&vfs, &image),
+            Some(Path::new("weights/weighted.png"))
+        );
+        assert_eq!(find_weight_path(&vfs, Path::new("images/plain.png")), None);
+        // Not a mask: the view stays transparent.
+        assert_eq!(find_mask_path(&vfs, &image), None);
+        assert_eq!(
+            find_image_by_name(&vfs, "weighted.png"),
+            Some(Path::new("images/weighted.png")),
+            "an image name must resolve to the image, never to its weight map"
+        );
     }
 
     /// `--alpha-mode` is a global force, not a per-view default: it overrides

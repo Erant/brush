@@ -1,7 +1,6 @@
 use super::{
     DatasetLoadResult, FormatError, find_image_by_name, find_mask_path, find_normal_path,
-    opengl_c2w_to_pose,
-    split_eval_every,
+    find_weight_path, opengl_c2w_to_pose, split_eval_every,
 };
 use crate::{
     Dataset,
@@ -130,6 +129,7 @@ async fn read_dataset_inner(
 
         let mask_path = find_mask_path(&vfs, &image_path).map(Path::to_path_buf);
         let normal_path = find_normal_path(&vfs, &image_path).map(Path::to_path_buf);
+        let weight_path = find_weight_path(&vfs, &image_path).map(Path::to_path_buf);
         let image = LoadImage::new(
             vfs.clone(),
             image_path,
@@ -137,7 +137,8 @@ async fn read_dataset_inner(
             load_args.max_resolution,
             load_args.alpha_mode,
         )
-        .with_normal_path(normal_path);
+        .with_normal_path(normal_path)
+        .with_weight_path(weight_path);
 
         // The csv carries no image dimensions; intrinsics are resolution
         // independent once expressed as fov + normalized center, so a

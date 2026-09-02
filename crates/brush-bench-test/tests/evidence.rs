@@ -62,6 +62,7 @@ fn half_masked_batch(camera: Camera) -> SceneBatch {
         alpha_coverage: Some(0.5),
         camera,
         normal_data: None,
+        loss_weight: None,
     }
 }
 

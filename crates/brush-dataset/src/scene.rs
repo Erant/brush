@@ -176,6 +176,26 @@ pub fn normal_sample_to_data(sample: DynamicImage) -> TensorData {
     TensorData::new(packed, [h as usize, w as usize])
 }
 
+/// A greyscale weight map to `[H, W]` f32 in `[0, 1]`, for
+/// [`SceneBatch::loss_weight`]. One float per pixel rather than the packed
+/// u32 the image uses: the trainer multiplies the loss map by it directly,
+/// so there is nothing to decode on the GPU, and a weight map is one
+/// channel to begin with.
+pub fn weight_sample_to_data(sample: &DynamicImage) -> TensorData {
+    let _span = tracing::trace_span!("weight_sample_to_data").entered();
+    let (w, h) = (sample.width(), sample.height());
+    let converted;
+    let raw = match sample {
+        DynamicImage::ImageLuma8(img) => img.as_raw(),
+        other => {
+            converted = other.to_luma8();
+            converted.as_raw()
+        }
+    };
+    let weights: Vec<f32> = raw.iter().map(|&v| f32::from(v) / 255.0).collect();
+    TensorData::new(weights, [h as usize, w as usize])
+}
+
 #[derive(Clone, Debug)]
 pub struct SceneBatch {
     /// `[H, W]` u32, each entry packs `[r g b a]` u8.
@@ -196,6 +216,12 @@ pub struct SceneBatch {
     /// `normals/` sibling was found — the normal loss is simply skipped for
     /// this batch in that case.
     pub normal_data: Option<TensorData>,
+    /// `[H, W]` f32 in `[0, 1]`: a per-pixel multiplier on this view's loss
+    /// map, from a `weights/` sidecar (see [`weight_sample_to_data`] and
+    /// `docs/loss-weights.md`). Applied on top of the alpha mode's own
+    /// weighting, to the photometric, alpha-match and normal terms alike,
+    /// and to the evidence pass. `None` means 1 everywhere.
+    pub loss_weight: Option<TensorData>,
 }
 
 impl SceneBatch {
@@ -206,8 +232,8 @@ impl SceneBatch {
 
 #[cfg(test)]
 mod tests {
-    use super::{mean_alpha, normal_sample_to_data, sample_to_packed_data};
-    use image::{DynamicImage, ImageBuffer, RgbImage, RgbaImage};
+    use super::{mean_alpha, normal_sample_to_data, sample_to_packed_data, weight_sample_to_data};
+    use image::{DynamicImage, GrayImage, ImageBuffer, RgbImage, RgbaImage};
 
     #[test]
     fn packs_rgba_samples_without_changing_channels() {
@@ -263,6 +289,25 @@ mod tests {
             packed.as_slice::<i32>().expect("i32 tensor"),
             &[0xff0b_0a09_u32 as i32, 0xff0e_0d0c_u32 as i32]
         );
+    }
+
+    #[test]
+    fn decodes_a_weight_map_to_unit_floats() {
+        let image = GrayImage::from_raw(3, 1, vec![0, 255, 51]).expect("valid grey image");
+        let data = weight_sample_to_data(&DynamicImage::ImageLuma8(image));
+        assert_eq!(data.shape.dims(), [1, 3]);
+        let got = data.as_slice::<f32>().expect("f32 tensor");
+        assert!((got[0] - 0.0).abs() < 1e-6 && (got[1] - 1.0).abs() < 1e-6);
+        assert!((got[2] - 0.2).abs() < 1e-6, "got {got:?}");
+    }
+
+    #[test]
+    fn reduces_a_colour_weight_map_to_luma() {
+        let image = RgbaImage::from_raw(1, 1, vec![255, 255, 255, 0]).unwrap();
+        let data = weight_sample_to_data(&DynamicImage::ImageRgba8(image));
+        // White is weight 1 whatever its alpha says: a weight map's own alpha
+        // is not a channel the trainer reads.
+        assert!((data.as_slice::<f32>().unwrap()[0] - 1.0).abs() < 1e-6);
     }
 
     #[test]

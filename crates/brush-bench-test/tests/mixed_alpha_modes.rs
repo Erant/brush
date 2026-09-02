@@ -78,6 +78,7 @@ fn batch(alpha_mode: AlphaMode, alpha_left: u32, alpha_right: u32) -> SceneBatch
         alpha_coverage: (alpha_mode == AlphaMode::Masked).then_some(coverage),
         camera: test_camera(),
         normal_data: None,
+        loss_weight: None,
     }
 }
 

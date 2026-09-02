@@ -202,6 +202,19 @@ pub async fn view_evidence(
         },
     );
     let m = map.clone().slice(s![.., .., 3..4]);
+    // A `weights/` sidecar scales this view's say the same way it scales
+    // its loss: `m` is the per-pixel "this view constrains here" weight,
+    // so w_in and the residual both shrink where the trainer was told to
+    // listen less. Without this a view whose loss was silenced over some
+    // region would still count as full evidence — and full disagreement —
+    // for whatever the other views put there.
+    let m = match &batch.loss_weight {
+        Some(data) => {
+            let w: Tensor<2> = Tensor::from_data(data.clone(), device);
+            m * w.unsqueeze_dim(2)
+        }
+        None => m,
+    };
     let mut res = map.slice(s![.., .., 0..3]).mean_dim(2);
 
     if normal_weight > 0.0

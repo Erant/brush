@@ -10,7 +10,7 @@ use crate::{
     stats::RefineRecord,
 };
 use brush_dataset::scene::SceneBatch;
-use brush_loss::{ImageLossConfig, image_loss};
+use brush_loss::{ImageLossConfig, image_loss, normal_loss_map};
 use brush_render::bwd::render_splats;
 use brush_render::gaussian_splats::Splats;
 use brush_render::{AlphaMode, bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
@@ -284,6 +284,22 @@ impl SplatTrainer {
             };
             let loss_map = image_loss(pred_for_loss, gt_packed.clone(), cfg);
 
+            // A `weights/` sidecar: a per-pixel multiplier on the whole loss
+            // map, on top of whatever the alpha mode did to it. Applied
+            // after the kernel rather than inside it — it is one broadcast
+            // multiply, and it has to reach the alpha-match lane and the
+            // normal term below as well, which the kernel's `mask` flag
+            // does not. Constant data, lifted to the autodiff backend as a
+            // leaf so the gradient flows through the multiply and stops.
+            let loss_weight: Option<Tensor<3>> = batch.loss_weight.map(|data| {
+                let w: Tensor<2> = Tensor::from_data(data, &device.clone().inner());
+                Tensor::from_inner(w.unsqueeze_dim(2))
+            });
+            let loss_map = match &loss_weight {
+                Some(w) => loss_map * w.clone(),
+                None => loss_map,
+            };
+
             let mut loss = if do_alpha_match {
                 let rgb = loss_map.clone().slice(s![.., .., 0..3]).mean();
                 let alpha = loss_map.slice(s![.., .., 3..4]).mean();
@@ -331,7 +347,21 @@ impl SplatTrainer {
                     .clone()
                     .expect("features were requested for the normal loss");
                 let gt_normal = Tensor::<2, Int>::from_data(normal_data, &device.clone().inner());
-                let n_loss = brush_loss::normal_loss(pred_normal, gt_normal);
+                // The masked mean `normal_loss` takes, with the weight folded
+                // into both the residual and the count: a weighted mean over
+                // the mask, so the unweighted region keeps its scale and a
+                // down-weighted one counts for exactly that much less.
+                let nmap = normal_loss_map(pred_normal, gt_normal); // [2, H, W]
+                let res = nmap.clone().slice(s![0..1, .., ..]);
+                let cnt = nmap.slice(s![1..2, .., ..]);
+                let (res, cnt) = match &loss_weight {
+                    Some(w) => {
+                        let w = w.clone().permute([2, 0, 1]);
+                        (res * w.clone(), cnt * w)
+                    }
+                    None => (res, cnt),
+                };
+                let n_loss = (res.sum() / cnt.sum().clamp_min(1.0)).reshape([1]);
                 // Subsampling is an unbiased estimator of the every-step
                 // objective: compensate for the lower sampling frequency.
                 loss = loss
