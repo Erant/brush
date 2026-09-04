@@ -172,6 +172,14 @@ pub(crate) async fn train_stream(
     let mut eval_scene = dataset.eval;
 
     let mut train_duration = Duration::from_secs(0);
+
+    // Latest sampled training loss, and when it was taken. Reading the loss
+    // scalar syncs the GPU queue, so sample it on a wall-clock cadence and
+    // resend the last value on steps that didn't take a fresh one.
+    const LOSS_SAMPLE_EVERY: Duration = Duration::from_secs(1);
+    let mut train_loss = None;
+    let mut last_loss_sample: Option<Instant> = None;
+
     let mut dataloader = SceneLoader::new(&dataset.train, 42, &train_stream_config.load_config);
     let bounds = get_splat_bounds(init_splats.clone(), BOUND_PERCENTILE).await;
 
@@ -354,6 +362,11 @@ pub(crate) async fn train_stream(
 
         let step_dur = step_time.elapsed();
         train_duration += step_dur;
+
+        if last_loss_sample.is_none_or(|last| last.elapsed() >= LOSS_SAMPLE_EVERY) {
+            last_loss_sample = Some(Instant::now());
+            train_loss = Some(stats.loss.clone().into_scalar_async::<f32>().await?);
+        }
 
         // Do evals. We skip this for LODs as it'd be confusing for rerun, but, could
         // revisit this.
@@ -550,6 +563,7 @@ pub(crate) async fn train_stream(
                     iter,
                     total_elapsed: train_duration,
                     lod_progress,
+                    train_loss,
                 }))
                 .await;
         }

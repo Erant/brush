@@ -64,6 +64,7 @@ impl TrainingPanel {
                 iter,
                 total_elapsed,
                 lod_progress,
+                ..
             } => {
                 self.train_progress = Some(*iter);
                 self.lod_progress = *lod_progress;

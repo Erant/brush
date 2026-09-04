@@ -12,7 +12,7 @@ use brush_process::message::TrainMessage;
 use clap::{Error, Parser, builder::ArgPredicate, error::ErrorKind};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tracing::trace_span;
@@ -50,6 +50,126 @@ impl Cli {
             ));
         }
         Ok(self)
+    }
+}
+
+/// How often the CLI prints its one-line training diagnostic.
+const DIAGNOSTIC_EVERY: Duration = Duration::from_secs(10);
+
+/// Print a line above the progress bars. When stdout isn't a terminal indicatif
+/// draws nothing at all, so fall back to a plain println there — the diagnostic
+/// is the whole point of a piped or logged run.
+fn report(sp: &MultiProgress, line: &str) {
+    if sp.is_hidden() {
+        println!("{line}");
+    } else {
+        let _ = sp.println(line);
+    }
+}
+
+/// Splat counts get big; keep them short in the diagnostic line.
+fn format_count(count: u32) -> String {
+    if count >= 1_000_000 {
+        format!("{:.2}M", f64::from(count) / 1e6)
+    } else if count >= 10_000 {
+        format!("{:.1}k", f64::from(count) / 1e3)
+    } else {
+        count.to_string()
+    }
+}
+
+/// Rolling training state, summarized into one line every [`DIAGNOSTIC_EVERY`].
+struct Diagnostics {
+    total_iters: u64,
+    iter: u32,
+    train_elapsed: Duration,
+    train_loss: Option<f32>,
+    splats: u32,
+    eval_views: u32,
+    lod_progress: Option<(u32, u32)>,
+    last_eval: Option<(u32, f32, f32)>,
+    /// Iteration and wall clock at the previous report, for the interval rate.
+    last_report: Option<(u32, Instant)>,
+}
+
+impl Diagnostics {
+    fn new(total_iters: u64) -> Self {
+        Self {
+            total_iters,
+            iter: 0,
+            train_elapsed: Duration::from_secs(0),
+            train_loss: None,
+            splats: 0,
+            eval_views: 0,
+            lod_progress: None,
+            last_eval: None,
+            last_report: None,
+        }
+    }
+
+    /// The diagnostic line, or `None` before the first training step (there's
+    /// nothing to say yet, and loading already has its own spinner).
+    fn line(&mut self, now: Instant) -> Option<String> {
+        if self.iter == 0 {
+            return None;
+        }
+
+        let mut parts = vec![format!("iter {}/{}", self.iter, self.total_iters)];
+
+        if let Some((lod, total_lods)) = self.lod_progress {
+            parts.push(format!("LOD {lod}/{total_lods}"));
+        }
+
+        // Rate since the last report (what you'd watch to spot a slowdown),
+        // plus the average over the trainer's own accumulated step time.
+        let rate = self.last_report.and_then(|(iter, at)| {
+            let secs = now.duration_since(at).as_secs_f64();
+            (secs > 0.0 && self.iter > iter).then(|| f64::from(self.iter - iter) / secs)
+        });
+        let avg_secs = self.train_elapsed.as_secs_f64();
+        let avg = (avg_secs > 0.0).then(|| f64::from(self.iter) / avg_secs);
+        match (rate, avg) {
+            (Some(rate), Some(avg)) => parts.push(format!("{rate:.1} it/s (avg {avg:.1})")),
+            (Some(rate), None) => parts.push(format!("{rate:.1} it/s")),
+            (None, Some(avg)) => parts.push(format!("avg {avg:.1} it/s")),
+            (None, None) => {}
+        }
+
+        if let Some(loss) = self.train_loss {
+            parts.push(format!("loss {loss:.5}"));
+        }
+
+        if self.splats > 0 {
+            parts.push(format!("{} splats", format_count(self.splats)));
+        }
+
+        match self.last_eval {
+            Some((iter, psnr, ssim)) => {
+                parts.push(format!("eval@{iter} {psnr:.2} PSNR / {ssim:.3} SSIM"));
+            }
+            None if self.eval_views > 0 => parts.push("eval pending".to_owned()),
+            None => {}
+        }
+
+        parts.push(format!(
+            "{} elapsed",
+            humantime::format_duration(Duration::from_secs(self.train_elapsed.as_secs()))
+        ));
+
+        // ETA off the interval rate rather than the average, so it tracks the
+        // speed the run is actually going at now.
+        if let Some(rate) = rate
+            && self.total_iters > u64::from(self.iter)
+        {
+            let left = (self.total_iters - u64::from(self.iter)) as f64 / rate;
+            parts.push(format!(
+                "~{} left",
+                humantime::format_duration(Duration::from_secs(left as u64))
+            ));
+        }
+
+        self.last_report = Some((self.iter, now));
+        Some(format!("📊 {}", parts.join(" · ")))
     }
 }
 
@@ -178,21 +298,41 @@ pub async fn run_cli_ui(
     log::info!("Starting up");
 
     if cfg!(debug_assertions) {
-        let _ =
-            sp.println("ℹ️  running in debug mode, compile with --release for best performance");
+        report(
+            &sp,
+            "ℹ️  running in debug mode, compile with --release for best performance",
+        );
     }
 
-    #[allow(unused_mut)]
-    let mut duration = Duration::from_secs(0);
+    let mut diag = Diagnostics::new(train_stream_config.train_config.total_iters() as u64);
 
-    while let Some(msg) = messages.recv().await {
+    // Fires the periodic diagnostic even while the trainer is quiet (loading,
+    // a long refine), so a stalled run is visible too.
+    let mut diag_tick = tokio::time::interval(DIAGNOSTIC_EVERY);
+    diag_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    diag_tick.tick().await; // The first tick resolves immediately.
+
+    loop {
+        let msg = tokio::select! {
+            msg = messages.recv() => match msg {
+                Some(msg) => msg,
+                None => break,
+            },
+            _ = diag_tick.tick() => {
+                if let Some(line) = diag.line(Instant::now()) {
+                    report(&sp, &line);
+                }
+                continue;
+            }
+        };
+
         let _span = trace_span!("CLI UI").entered();
 
         let msg = match msg {
             Ok(msg) => msg,
             Err(error) => {
                 // Don't print the error here. It'll bubble up and be printed as output.
-                let _ = sp.println("❌ Encountered an error");
+                report(&sp, "❌ Encountered an error");
                 return Err(error);
             }
         };
@@ -204,12 +344,17 @@ pub async fn run_cli_ui(
             ProcessMessage::StartLoading { name, training, .. } => {
                 if !training {
                     // Display a big warning saying viewing splats from the CLI doesn't make sense.
-                    let _ = sp.println("❌ Only training is supported in the CLI (try passing --with-viewer to view a splat)");
+                    report(
+                        &sp,
+                        "❌ Only training is supported in the CLI (try passing --with-viewer to view a splat)",
+                    );
                     break;
                 }
                 main_spinner.set_message(format!("Loading {name}..."));
             }
-            ProcessMessage::SplatsUpdated { .. } => {}
+            ProcessMessage::SplatsUpdated { num_splats, .. } => {
+                diag.splats = num_splats;
+            }
             ProcessMessage::TrainMessage(train) => match train {
                 TrainMessage::TrainConfig { .. } => {}
                 TrainMessage::Dataset { dataset } => {
@@ -221,6 +366,7 @@ pub async fn run_cli_ui(
                     main_spinner.set_message(format!(
                         "Loading dataset with {train_views} training, {eval_views} eval views",
                     ));
+                    diag.eval_views = eval_views as u32;
                     if eval_views > 0 {
                         eval_spinner.set_message(format!(
                             "evaluating {} views every {} steps",
@@ -234,7 +380,7 @@ pub async fn run_cli_ui(
                     iter,
                     total_elapsed,
                     lod_progress,
-                    ..
+                    train_loss,
                 } => {
                     if let Some((lod, total_lods)) = lod_progress {
                         main_spinner.set_message(format!("LOD {lod}/{total_lods}"));
@@ -242,15 +388,18 @@ pub async fn run_cli_ui(
                         main_spinner.set_message("Training");
                     }
                     train_progress.set_position(iter as u64);
-                    duration = total_elapsed;
+                    diag.iter = iter;
+                    diag.train_elapsed = total_elapsed;
+                    diag.lod_progress = lod_progress;
+                    diag.train_loss = train_loss;
                 }
                 TrainMessage::RefineStep {
                     cur_splat_count,
                     iter,
-                    ..
                 } => {
                     stats_spinner.set_message(format!("Current splat count {cur_splat_count}"));
                     log::info!("Refine iter {iter}, {cur_splat_count} splats.");
+                    diag.splats = cur_splat_count;
                 }
                 TrainMessage::EvalResult {
                     iter,
@@ -262,6 +411,7 @@ pub async fn run_cli_ui(
                     eval_spinner.set_message(format!(
                         "Eval iter {iter}: PSNR {avg_psnr}, ssim {avg_ssim}"
                     ));
+                    diag.last_eval = Some((iter, avg_psnr, avg_ssim));
                 }
                 TrainMessage::DoneTraining => {}
             },
@@ -272,18 +422,27 @@ pub async fn run_cli_ui(
             }
             ProcessMessage::Warning { error } => {
                 log::warn!("{error}");
-                sp.println(format!("⚠️: {error}"))?;
+                report(&sp, &format!("⚠️: {error}"));
             }
             #[allow(unreachable_patterns)]
             _ => {}
         }
     }
 
-    let duration_secs = Duration::from_secs(duration.as_secs());
-    let _ = sp.println(format!(
-        "Training took {}",
-        humantime::format_duration(duration_secs)
-    ));
+    // A final diagnostic, so a finished run leaves its numbers behind even if
+    // it ended between ticks.
+    if let Some(line) = diag.line(Instant::now()) {
+        report(&sp, &line);
+    }
+
+    let duration_secs = Duration::from_secs(diag.train_elapsed.as_secs());
+    report(
+        &sp,
+        &format!(
+            "Training took {}",
+            humantime::format_duration(duration_secs)
+        ),
+    );
 
     log::info!(
         "Done training! Took {:?}.",
@@ -297,6 +456,57 @@ pub async fn run_cli_ui(
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn formats_counts() {
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(9_999), "9999");
+        assert_eq!(format_count(45_678), "45.7k");
+        assert_eq!(format_count(2_500_000), "2.50M");
+    }
+
+    #[test]
+    fn diagnostics_stay_quiet_before_the_first_step() {
+        let mut diag = Diagnostics::new(1000);
+        assert!(diag.line(Instant::now()).is_none());
+    }
+
+    #[test]
+    fn diagnostics_report_rate_psnr_and_eta() {
+        let mut diag = Diagnostics::new(1000);
+        diag.eval_views = 5;
+        diag.iter = 100;
+        diag.train_elapsed = Duration::from_secs(2);
+        diag.splats = 45_678;
+
+        // No previous report yet, so only the average rate is known.
+        let start = Instant::now();
+        let first = diag.line(start).expect("a step has landed");
+        assert!(first.contains("iter 100/1000"), "{first}");
+        assert!(first.contains("avg 50.0 it/s"), "{first}");
+        assert!(first.contains("45.7k splats"), "{first}");
+        assert!(first.contains("eval pending"), "{first}");
+        // Nothing to extrapolate an ETA from on the first line.
+        assert!(!first.contains("left"), "{first}");
+
+        diag.iter = 300;
+        diag.train_elapsed = Duration::from_secs(6);
+        diag.train_loss = Some(0.0421);
+        diag.last_eval = Some((200, 24.5, 0.8123));
+
+        let second = diag
+            .line(start + Duration::from_secs(10))
+            .expect("still training");
+        // 200 iters in 10s of wall clock, 300 iters in 6s of trainer time.
+        assert!(second.contains("20.0 it/s (avg 50.0)"), "{second}");
+        assert!(second.contains("loss 0.04210"), "{second}");
+        assert!(
+            second.contains("eval@200 24.50 PSNR / 0.812 SSIM"),
+            "{second}"
+        );
+        // 700 iters left at the interval rate.
+        assert!(second.contains("~35s left"), "{second}");
+    }
 
     #[test]
     fn parses_source_and_overrides() {

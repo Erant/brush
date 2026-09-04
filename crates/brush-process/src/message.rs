@@ -21,6 +21,11 @@ pub enum TrainMessage {
         total_elapsed: web_time::Duration,
         /// If in LOD phase: `(current_lod_1_based, total_lod_levels)`.
         lod_progress: Option<(u32, u32)>,
+        /// Most recent total training loss. Reading it costs a GPU readback, so
+        /// it's sampled on a wall-clock cadence rather than every step, and the
+        /// last sample is repeated until a fresh one is taken. `None` until the
+        /// first sample.
+        train_loss: Option<f32>,
     },
     /// Some number of training steps are done.
     #[allow(unused)]
