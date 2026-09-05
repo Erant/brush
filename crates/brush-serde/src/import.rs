@@ -162,28 +162,53 @@ fn interleave_coeffs(sh_dc: Vec3, sh_rest: &[f32], result: &mut Vec<f32>) {
     }
 }
 
+/// Tops `buf` up with up to ~8 MiB more data from `reader`.
+///
+/// Returns whether any new bytes were actually appended. Getting none back is *not* itself an
+/// error — it is the ordinary way a reader signals "that's everything", and for a small (or
+/// small-remainder) file it is entirely normal for the previous call to have already buffered
+/// every byte the file has, including a complete final row. Whether "no new bytes" means the
+/// file is exhausted-but-complete or exhausted-but-truncated depends on what the caller's row
+/// parser does with what is *already* buffered — that's for the caller to decide (see the
+/// `made_progress` callers below), not this function.
+///
+/// This used to decide EOF itself, by checking whether `buf.len()` (old-plus-new bytes) was
+/// zero rather than whether any *new* bytes had arrived this call. Past the very first call,
+/// `buf.len()` is essentially always non-zero — a partial row's worth of bytes is routinely left
+/// sitting at the tail after a caller's parser consumes every complete row it can — so that check
+/// could only ever fire once, on a literally-empty file. Every later call at real EOF returned
+/// `Ok(())` claiming success while adding nothing, so a genuinely truncated/corrupt PLY (header
+/// declares more vertices than the file holds) was never detected: the caller's row loop parsed
+/// zero further rows forever, and `parse_ply`'s `loop {}` spun at ~100% CPU indefinitely instead
+/// of ever returning the `UnexpectedEof` it was meant to.
 async fn read_chunk<T: AsyncRead + Unpin>(
     mut reader: T,
     buf: &mut Vec<u8>,
-) -> tokio::io::Result<()> {
+) -> tokio::io::Result<bool> {
     buf.reserve(8 * 1024 * 1024);
-    let mut total_read = buf.len();
-    while total_read < buf.capacity() {
+    let target = buf.capacity();
+    let mut new_bytes = 0usize;
+    while buf.len() < target {
         let bytes_read = reader.read_buf(buf).await?;
         if bytes_read == 0 {
             break;
         }
-        total_read += bytes_read;
+        new_bytes += bytes_read;
         brush_async::yield_now().await;
     }
-    if total_read == 0 {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "Unexpected EOF",
-        ))
-    } else {
-        Ok(())
-    }
+    Ok(new_bytes > 0)
+}
+
+/// The truncated/corrupt-file error `parse_ply`/`parse_compressed_ply` raise when a read loop
+/// made no progress at all — neither new bytes from the reader nor a new row parsed from what
+/// was already buffered — before the element's declared row count was reached.
+fn unexpected_eof() -> DeserializeError {
+    std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "Unexpected EOF: PLY file ended before its header's declared vertex/row count was \
+         reached (the file is truncated or corrupt)",
+    )
+    .into()
 }
 
 pub async fn load_splat_from_ply<T: AsyncRead + Unpin>(
@@ -363,7 +388,8 @@ async fn parse_ply<T: AsyncRead + Unpin>(
     let mut row_index: usize = 0;
 
     loop {
-        read_chunk(&mut reader, file.buffer_mut()).await?;
+        let made_progress = read_chunk(&mut reader, file.buffer_mut()).await?;
+        let row_index_before = row_index;
 
         RowVisitor::new(|mut gauss: PlyGaussian| {
             row_index += 1;
@@ -405,6 +431,13 @@ async fn parse_ply<T: AsyncRead + Unpin>(
             }
         })
         .deserialize(&mut *file)?;
+
+        // Neither the reader nor the row parser made any progress this pass: the file ran out
+        // before `total_splats` rows were seen. Without this check the loop above would repeat
+        // forever, since a real EOF makes `read_chunk` return `false` on every subsequent call.
+        if !made_progress && row_index == row_index_before {
+            return Err(unexpected_eof());
+        }
 
         if update.should_update(row_index as f32 / total_splats as f32) || row_index == total_splats
         {
@@ -486,11 +519,17 @@ async fn parse_compressed_ply<T: AsyncRead + Unpin>(
     while let Some(element) = file.current_element()
         && element.name == "chunk"
     {
-        read_chunk(&mut reader, file.buffer_mut()).await?;
+        let made_progress = read_chunk(&mut reader, file.buffer_mut()).await?;
+        let metas_before = quant_metas.len();
         RowVisitor::new(|meta: QuantMeta| {
             quant_metas.push(meta);
         })
         .deserialize(&mut file)?;
+        // See the identical check in `parse_ply`: without it, a truncated "chunk" element's
+        // worth of metadata leaves `current_element()` pointing at the same element forever.
+        if !made_progress && quant_metas.len() == metas_before {
+            return Err(unexpected_eof());
+        }
     }
 
     let vertex = file
@@ -522,7 +561,8 @@ async fn parse_compressed_ply<T: AsyncRead + Unpin>(
     while let Some(element) = file.current_element()
         && element.name == "vertex"
     {
-        read_chunk(&mut reader, file.buffer_mut()).await?;
+        let made_progress = read_chunk(&mut reader, file.buffer_mut()).await?;
+        let row_count_before = row_count;
 
         RowVisitor::new(|splat: QuantSplat| {
             let quant_data = &quant_metas[row_count / 256];
@@ -546,6 +586,11 @@ async fn parse_compressed_ply<T: AsyncRead + Unpin>(
             sh_coeffs.extend([sh_dc.x, sh_dc.y, sh_dc.z]);
         })
         .deserialize(&mut file)?;
+
+        // See the identical check in `parse_ply`.
+        if !made_progress && row_count == row_count_before {
+            return Err(unexpected_eof());
+        }
 
         // Occasionally send some updated splats.
         if update.should_update(row_count as f32 / total_splats as f32) || row_count == total_splats
@@ -582,7 +627,8 @@ async fn parse_compressed_ply<T: AsyncRead + Unpin>(
         while let Some(element) = file.current_element()
             && element.name == "sh"
         {
-            read_chunk(&mut reader, file.buffer_mut()).await?;
+            let made_progress = read_chunk(&mut reader, file.buffer_mut()).await?;
+            let row_count_before = row_count;
 
             RowVisitor::new(|quant_sh: QuantSh| {
                 row_count += 1;
@@ -602,6 +648,11 @@ async fn parse_compressed_ply<T: AsyncRead + Unpin>(
                 splat_index += 1;
             })
             .deserialize(&mut file)?;
+
+            // See the identical check in `parse_ply`.
+            if !made_progress && row_count == row_count_before {
+                return Err(unexpected_eof());
+            }
         }
 
         let meta = ParseMetadata {
@@ -689,6 +740,32 @@ mod tests {
         let cursor = Cursor::new(ply_bytes);
         let imported_message = load_splat_from_ply(cursor, Some(2)).await.unwrap();
         assert_eq!(imported_message.data.num_splats(), 2);
+    }
+
+    #[wasm_bindgen_test(unsupported = tokio::test)]
+    async fn test_import_truncated_ply_errors_instead_of_hanging() {
+        // Regression test: a PLY whose header declares more vertices than the file actually
+        // holds (a partial write from a crashed exporter, a disk-full error mid-export, a
+        // network transfer cut short, ...) used to make `read_chunk` return `Ok(())` forever
+        // once the row loop's leftover partial-row bytes made its buffer non-empty, so
+        // `parse_ply`'s `loop {}` spun at 100% CPU indefinitely instead of erroring. This test
+        // hangs (and times out under `cargo nextest`'s default per-test deadline, or under CI's
+        // overall job timeout) if that regresses; it should complete in well under a second.
+        let _device = brush_cube::test_helpers::test_device().await;
+        // Enough rows that a single 8 MiB `read_chunk` call reads real data but doesn't finish
+        // the file, and that cutting the buffer at 90% lands inside a row rather than exactly on
+        // a row boundary.
+        let original_splats = create_test_splats_with_count(1, 64);
+        let ply_bytes = splat_to_ply(original_splats, None).await.unwrap();
+
+        let truncated = &ply_bytes[..ply_bytes.len() * 9 / 10];
+        let cursor = Cursor::new(truncated.to_vec());
+        let result = load_splat_from_ply(cursor, None).await;
+
+        assert!(
+            result.is_err(),
+            "loading a truncated PLY should fail, not silently return a partial splat"
+        );
     }
 
     #[test]
