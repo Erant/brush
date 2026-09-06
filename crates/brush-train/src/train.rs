@@ -179,11 +179,20 @@ impl SplatTrainer {
         self.view_cams = view_cams;
     }
 
+    /// Resume the step-driven schedules (mean LR decay, normal-loss start)
+    /// at `step` rather than 0, so a run continued with `--start-iter N`
+    /// from an `init.ply` trains as the tail of one long run rather than as
+    /// a fresh run with a full-strength LR. Growth is already gated on the
+    /// global iteration the process passes into `refine`.
+    pub fn set_step_count(&mut self, step: u32) {
+        self.step_count = step;
+    }
+
     pub async fn step(&mut self, batch: SceneBatch, splats: Splats) -> (Splats, TrainStepStats) {
         let mut splats = splats;
 
         // Track max SH degree from the first splats we see.
-        if self.step_count == 0 {
+        if self.max_sh_degree == 0 {
             self.max_sh_degree = splats.sh_degree();
         }
         self.step_count += 1;

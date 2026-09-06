@@ -194,6 +194,7 @@ pub(crate) async fn train_stream(
 
     let mut trainer = SplatTrainer::new(&train_stream_config.train_config, &device, bounds);
     trainer.set_view_cams(view_cams.clone());
+    trainer.set_step_count(process_config.start_iter);
 
     // Get the dataset name from the base path (if available) for interpolation.
     let dataset_name = vfs

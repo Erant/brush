@@ -15,14 +15,14 @@
 //! for any constant per-pixel weight map `V`. So rendering a *zero* feature
 //! and backpropagating `Σ_p F_p·V_p` turns the existing autodiff backward
 //! into a per-splat accumulator of whatever `V` encodes. With
-//! `V_p = (m_p, m_p·res_p, 1)` — `m` the GT alpha (mask or matte), `res` the
+//! `V_p = (m_p, m_p·res_p, w_p·k_p)` — `m` the GT alpha (mask or matte) times the view's loss weight `w`, `k` that mask again for a MASKED view (1 for a transparent one), `res` the
 //! photometric residual — each splat collects, per view:
 //!
 //! | lane | meaning |
 //! |---|---|
 //! | `w_in  = Σ vis·m`     | contribution mass landing inside GT foreground |
 //! | `e     = Σ vis·m·res` | mass-weighted residual where the splat is used |
-//! | `w_all = Σ vis`       | total contribution mass |
+//! | `w_all = Σ vis·w·k`   | total contribution mass, `w` the view's loss weight (1 without a `weights/` sidecar), `k` the mask for a masked view: outside a mask is "ignore", not background |
 //!
 //! Summed over views, plus a view count and the resultant of observation
 //! directions, that is the whole [`SplatEvidence`].
@@ -33,6 +33,7 @@ use brush_dataset::scene_loader::load_view_batch;
 use brush_loss::{ImageLossConfig, image_loss_eval, normal_loss_eval};
 use brush_render::burn_glue::detach_autodiff;
 use brush_render::bwd::burn_glue::lift_splats_to_autodiff;
+use brush_render::AlphaMode;
 use brush_render::camera::Camera;
 use brush_render::gaussian_splats::Splats;
 pub use brush_serde::{EVIDENCE_FIELDS, EVIDENCE_STRIDE};
@@ -208,12 +209,35 @@ pub async fn view_evidence(
     // listen less. Without this a view whose loss was silenced over some
     // region would still count as full evidence — and full disagreement —
     // for whatever the other views put there.
-    let m = match &batch.loss_weight {
+    //
+    // `w_all` (the third lane) is what `w_in` is measured against, and two
+    // things must scale it the same way they scale `w_in`, or `w_in / w_all`
+    // stops being an in-mask FRACTION:
+    //
+    // - a MASKED view's mask. Outside it the view says nothing — "ignore",
+    //   not "background" — so mass drawn there is neither in nor out. A
+    //   masked face close-up otherwise counted every hair, neck and torso
+    //   splat it could see as drawing over background, and the gate culled
+    //   them at novel views (measured: 65% of the face, 59% of the hair,
+    //   67% of the top on a face-cap run; all from this term).
+    // - the `weights/` map. A silenced region must not vote in the
+    //   denominator at full strength while voting in the numerator at 0.1.
+    //
+    // A TRANSPARENT view's alpha is not applied here: there, alpha 0 does
+    // mean background, and mass drawn over it is exactly what the term
+    // exists to catch (silhouette fringe, the dark wedges between limbs).
+    let base_all = if batch.alpha_mode == AlphaMode::Masked && batch.has_alpha {
+        m.clone()
+    } else {
+        Tensor::ones([h, w, 1], device)
+    };
+    let (m, wmap) = match &batch.loss_weight {
         Some(data) => {
-            let w: Tensor<2> = Tensor::from_data(data.clone(), device);
-            m * w.unsqueeze_dim(2)
+            let wt: Tensor<2> = Tensor::from_data(data.clone(), device);
+            let wt = wt.unsqueeze_dim(2);
+            (m * wt.clone(), base_all * wt)
         }
-        None => m,
+        None => (m, base_all),
     };
     let mut res = map.slice(s![.., .., 0..3]).mean_dim(2);
 
@@ -237,7 +261,7 @@ pub async fn view_evidence(
         res = res + nres * normal_weight;
     }
 
-    let v = Tensor::cat(vec![m.clone(), m * res, Tensor::ones([h, w, 1], device)], 2);
+    let v = Tensor::cat(vec![m.clone(), m * res, wmap], 2);
     let v: Tensor<3> = Tensor::from_inner(v);
     let loss = (out.features.expect("evidence features") * v).sum();
     let mut grads = loss.backward();

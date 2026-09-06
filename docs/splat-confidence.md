@@ -25,7 +25,7 @@ between the render (on black) and the GT:
 |---|---|
 | `w_in  = Σ_p vis·m`     | contribution mass landing inside GT foreground |
 | `e     = Σ_p vis·m·res` | mass-weighted residual where the splat is used |
-| `w_all = Σ_p vis`       | total contribution mass |
+| `w_all = Σ_p vis·w_p·k_p` | total contribution mass, `w_p` the view's `weights/` loss weight (1 without one) and `k_p` the mask for a MASKED view (1 for a transparent one): outside a mask is "ignore", not background, so it counts in neither lane |
 
 Summed over all views, plus:
 
